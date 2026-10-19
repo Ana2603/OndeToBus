@@ -24,6 +24,7 @@ Variáveis de ambiente opcionais:
 import os
 import sqlite3
 import time
+import random
 from pathlib import Path
 from flask import Flask, jsonify, request, g, render_template, send_from_directory
 
@@ -37,53 +38,43 @@ DB_PATH = Path(os.environ.get("DB_PATH", BASE_DIR / "onibus.db"))
 
 app = Flask(__name__)
 
-# Única linha cadastrada: Linha 02 · Noêmia / Santa Helena / UFSM
-# (TNSG — Cachoeira do Sul), reproduzida a partir do traçado do app.
+# Linhas reais da TNSG (Transportes Nossa Senhora das Graças), operadora de
+# Cachoeira do Sul — https://www.tnsg.com.br/index.php?area=linhas
 #
-# "stops" = pontos NOMEADOS da linha (os nomes aparecem como no mapa do app):
-#   UFSM → Stok Center → Medianeira → Santa Helena → Centro → Hospital (H)
-#
-# "path" = pontos do traçado em si (a linha verde que segue as ruas), na
-# ordem do percurso. Use "path" para desenhar a polilinha no mapa.
-#
-# ATENÇÃO: as coordenadas foram estimadas a partir da captura de tela
-# (usando a UFSM como âncora), então são APROXIMADAS. Para ficar milimétrico,
-# clique com o botão direito no ponto no Google Maps e copie as coordenadas.
+# "stops" é a sequência de pontos que forma o traçado da linha no mapa.
+# Os nomes dos pontos vêm dos horários oficiais da TNSG; as coordenadas de
+# UFSM e Rodoviária foram conferidas, as demais são aproximadas (marcadas
+# com # TODO) — ajuste com coordenadas reais copiando do Google Maps
+# (clique direito no ponto → clique nas coordenadas pra copiar).
 LINES = [
     {
-        "id": "02",
-        "name": "02 · Noêmia / Santa Helena / UFSM",
-        "color": "#1B7F4B",
+        "id": "011",
+        "name": "011 · Noêmia / Santa Helena / UFSM",
+        "color": "#FFC94D",
         "stops": [
+            {"name": "Hotel União", "lat": -30.020594924095338, "lng": -52.90985759824691},   # TODO: ajustar
+            {"name": "Rodoviária", "lat": -30.035882741950257, "lng": -52.91323844533343},    # TODO: ajustar
             {"name": "UFSM · Campus Cachoeira do Sul", "lat": -30.00641943463219, "lng": -52.94003979869694},
-            {"name": "Stok Center", "lat": -30.00680, "lng": -52.92924},
-            {"name": "Medianeira", "lat": -30.01035, "lng": -52.92717},
-            {"name": "Santa Helena", "lat": -30.01633, "lng": -52.92289},
-            {"name": "Centro", "lat": -30.02194, "lng": -52.91498},
-            {"name": "Hospital", "lat": -30.02538, "lng": -52.91347},
-        ],
-        "path": [
-            [-30.00474, -52.94069],
-            [-30.00522, -52.93939],
-            [-30.00642, -52.93745],
-            [-30.00691, -52.93183],
-            [-30.00680, -52.92924],
-            [-30.00642, -52.92803],
-            [-30.00829, -52.92751],
-            [-30.01035, -52.92717],
-            [-30.00997, -52.92470],
-            [-30.01128, -52.92406],
-            [-30.01371, -52.92362],
-            [-30.01633, -52.92289],
-            [-30.01764, -52.92060],
-            [-30.01858, -52.91887],
-            [-30.02007, -52.91714],
-            [-30.02194, -52.91498],
-            [-30.02306, -52.91369],
-            [-30.02419, -52.91261],
-            [-30.02538, -52.91347],
+            {"name": "5 Esquinas", "lat": -30.034176171465678, "lng": -52.90682109971603},    # TODO: ajustar
         ],
     },
+    {
+        "id": "031",
+        "name": "031 · Cohab / Prado",
+        "color": "#3FA796",
+        "stops": [
+            {"name": "Fenarroz", "lat": -30.04748973039611, "lng": -52.88076382175643},   # TODO: ajustar
+            {"name": "Hotel União", "lat": -30.020594924095338, "lng": -52.90985759824691},
+            {"name": "Cohab - V. Nova", "lat": -30.029826, "lng": -52.922609},  # TODO: ajustar
+            {"name": "Av. Brasil", "lat": -30.01757380772811, "lng": -52.91039396067508},  # TODO: ajustar
+            {"name": "Rodoviária", "lat": -30.035882741950257, "lng": -52.91323844533343},
+        ],
+    },
+    {"id": "001", "name": "001 · Quinta", "color": "#5B8DEF", "stops": []},
+    {"id": "021", "name": "021 · Promorar", "color": "#E4572E", "stops": []},
+    {"id": "041", "name": "041 · Soares P. Verde", "color": "#9B6BD9", "stops": []},
+    {"id": "072", "name": "072 · Charqueada / Centro / Prado", "color": "#2FA1D8", "stops": []},
+    {"id": "081", "name": "081 · Ponche Verde / Fátima", "color": "#D8A22F", "stops": []},
 ]
 
 STATUS_LABELS = {
@@ -91,6 +82,9 @@ STATUS_LABELS = {
     "atrasado": "Atrasado",
     "quebrado": "Quebrado",
 }
+
+# Ponto de referência para gerar dados de exemplo (Cachoeira do Sul - RS)
+CENTER_LAT, CENTER_LNG = -30.0392, -52.8939
 
 
 def get_db():
@@ -133,14 +127,20 @@ def init_db():
     conn.commit()
 
     if fresh:
-        # Popula com um relato de exemplo (no primeiro ponto da linha)
-        # para o mapa não nascer vazio.
+        # Popula com alguns relatos de exemplo para o mapa não nascer vazio.
+        # Se a linha já tem "stops" reais cadastrados, usa o primeiro ponto
+        # da rota; senão, gera um ponto aproximado perto do centro da cidade.
         now = time.time()
         for line in LINES:
-            first = line["stops"][0]
+            if line.get("stops"):
+                lat = line["stops"][0]["lat"]
+                lng = line["stops"][0]["lng"]
+            else:
+                lat = CENTER_LAT + random.uniform(-0.01, 0.01)
+                lng = CENTER_LNG + random.uniform(-0.01, 0.01)
             conn.execute(
                 "INSERT INTO reports (line_id, lat, lng, status, created_at) VALUES (?,?,?,?,?)",
-                (line["id"], first["lat"], first["lng"], "no_horario", now - 60),
+                (line["id"], lat, lng, "no_horario", now - random.randint(30, 400)),
             )
         # Cartão de exemplo para testar a recarga simulada
         conn.execute(
@@ -194,7 +194,6 @@ def api_status():
             "name": line["name"],
             "color": line["color"],
             "stops": line.get("stops", []),
-            "path": line.get("path", []),
             "status": row["status"] if row else None,
             "status_label": STATUS_LABELS.get(row["status"]) if row else "Sem relatos",
             "lat": row["lat"] if row else None,
