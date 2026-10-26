@@ -1,9 +1,10 @@
 """
 OndeToBus — protótipo de rastreamento colaborativo de ônibus.
 
-Este é um projeto acadêmico (Projeto Integrador I). A localização dos ônibus
-é alimentada pelos próprios usuários (rastreamento colaborativo), e a
-"recarga de cartão" é SIMULADA — não processa pagamentos reais.
+Projeto acadêmico (Projeto Integrador I). A localização dos ônibus vem dos
+próprios usuários (rastreamento colaborativo) e, para a Linha 02, também de
+uma SIMULAÇÃO baseada na tabela de horários oficial (dias úteis). A "recarga
+de cartão" é SIMULADA — não processa pagamentos reais.
 
 Como rodar:
     pip install -r requirements.txt
@@ -11,46 +12,33 @@ Como rodar:
 Depois abra http://localhost:5000 no navegador.
 
 Variáveis de ambiente opcionais:
-    PORT        — porta em que o servidor escuta (o Render define isso
-                  sozinho; localmente usa 5000 se não for definida).
-    FLASK_DEBUG — "1" liga o modo debug do Flask (recarrega sozinho,
-                  mostra stacktrace no navegador). Deixe desligado (padrão)
-                  em produção — é um risco de segurança expor o debugger.
-    DB_PATH     — caminho do arquivo SQLite. Só precisa mexer nisso se
-                  for usar um Persistent Disk no Render (veja nota mais
-                  abaixo sobre disco efêmero).
+    PORT        — porta do servidor (padrão 5000).
+    FLASK_DEBUG — "1" liga o modo debug (deixe desligado em produção).
+    DB_PATH     — caminho do arquivo SQLite (útil com Persistent Disk).
 """
 
 import os
 import sqlite3
 import time
 import json
+import math
 import urllib.request
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request, g, render_template, send_from_directory
 
 BASE_DIR = Path(__file__).parent
-# Por padrão o banco fica junto do código (BASE_DIR). Se depois você
-# adicionar um Persistent Disk no Render (para o banco não "zerar" a
-# cada deploy/reinício, já que o disco padrão do Render é efêmero),
-# basta apontar a variável de ambiente DB_PATH para o caminho montado
-# (ex.: /var/data/onibus.db) — sem precisar mexer no código.
 DB_PATH = Path(os.environ.get("DB_PATH", BASE_DIR / "onibus.db"))
+# Cache do traçado já encaixado nas ruas (evita chamar o OSRM a cada reinício).
+PATH_CACHE_FILE = DB_PATH.with_name("path_cache.json")
+TZ = ZoneInfo("America/Sao_Paulo")
 
 app = Flask(__name__)
 
-# Única linha cadastrada: Linha 02 · Noêmia / Santa Helena / UFSM
-# (TNSG — Cachoeira do Sul), reproduzida a partir do traçado do app.
-#
-# "stops" = pontos NOMEADOS da linha (os nomes aparecem como no mapa do app):
-#   UFSM → Stok Center → Medianeira → Santa Helena → Centro → Hospital (H)
-#
-# "path" = pontos do traçado em si (a linha verde que segue as ruas), na
-# ordem do percurso. Use "path" para desenhar a polilinha no mapa.
-#
-# ATENÇÃO: as coordenadas foram estimadas a partir da captura de tela
-# (usando a UFSM como âncora), então são APROXIMADAS. Para ficar milimétrico,
-# clique com o botão direito no ponto no Google Maps e copie as coordenadas.
+# Linha 02 · Noêmia / Santa Helena / UFSM (Cachoeira do Sul).
+# "stops" = pontos nomeados; "path" = traçado aproximado (ordem UFSM → Hospital),
+# encaixado nas ruas reais pelo OSRM em snapped_path().
 LINES = [
     {
         "id": "02",
@@ -62,7 +50,7 @@ LINES = [
             {"name": "Medianeira", "lat": -30.01035, "lng": -52.92717},
             {"name": "Santa Helena", "lat": -30.01633, "lng": -52.92289},
             {"name": "Centro", "lat": -30.02194, "lng": -52.91498},
-            {"name": "Hospital", "lat": -30.02538, "lng": -52.91347},
+            {"name": "Hospital (HCB)", "lat": -30.02538, "lng": -52.91347},
         ],
         "path": [
             [-30.00474, -52.94069],
@@ -88,59 +76,145 @@ LINES = [
     },
 ]
 
-# --- Ajuste do traçado às ruas -------------------------------------------
-# Os pontos de "path" foram estimados a partir de uma imagem, então ficam
-# um pouco fora das ruas. Aqui eles são "encaixados" nas ruas reais usando o
-# serviço gratuito OSRM (dados do OpenStreetMap). O resultado fica em cache
-# na memória para não gastar banda nem chamar o serviço a cada requisição.
-# Se o OSRM estiver fora do ar, usa o traçado bruto de "path" (sem quebrar).
+# Tabela de horários da Linha 002 (Cachoeira Mobilidade) — DIAS ÚTEIS.
+# Cada viagem: (saída da UFSM, chegada ao HCB). A tabela só traz o sentido
+# UFSM → HCB; o sentido HCB → UFSM não consta nela.
+_A = ["6:00-6:30", "7:00-7:30", "7:15-7:45", "8:00-8:30", "9:10-9:45", "10:20-11:00",
+      "11:30-12:10", "12:40-13:20", "13:50-14:30", "15:00-15:40", "16:10-16:50",
+      "17:20-18:00", "18:30-19:10", "19:30-20:10", "20:50-21:30", "22:05-22:45",
+      "23:00-23:40"]
+_B = ["6:30-7:00", "7:30-8:05", "8:35-9:15", "9:45-10:25", "10:55-11:35", "12:05-12:45",
+      "13:15-13:55", "14:25-15:05", "15:35-16:15", "16:45-17:25", "17:55-18:35",
+      "19:05-19:45"]
+
+
+def _mins(hhmm):
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+TIMETABLE = {
+    "02": [
+        (_mins(a), _mins(b), tag)
+        for tag, rows in (("002A · H.U.", _A), ("002B · Rodoviária", _B))
+        for a, b in (r.split("-") for r in rows)
+    ]
+}
+TIMETABLE["02"].sort()
+
+# --- Traçado nas ruas (OSRM + cache em disco) ------------------------------
 _PATH_CACHE = {}  # line_id -> (timestamp, caminho, deu_certo)
 _RETRY_SECONDS = 300
+_GEOM = {}  # line_id -> (id(path), distâncias acumuladas) p/ a simulação
 
 
-def _osrm(kind, coords):
+def _osrm(coords):
     pts = ";".join(f"{lng},{lat}" for lat, lng in coords)
-    base = "https://router.project-osrm.org"
-    if kind == "match":
-        radii = ";".join(["60"] * len(coords))
-        url = f"{base}/match/v1/driving/{pts}?geometries=geojson&overview=full&radiuses={radii}"
-        key = "matchings"
-    else:
-        url = f"{base}/route/v1/driving/{pts}?geometries=geojson&overview=full"
-        key = "routes"
+    url = ("https://router.project-osrm.org/route/v1/driving/"
+           f"{pts}?geometries=geojson&overview=full&continue_straight=true")
     req = urllib.request.Request(
-        url, headers={"User-Agent": "OndeToBus/1.0 (projeto academico UFSM)"}
-    )
-    with urllib.request.urlopen(req, timeout=6) as resp:
+        url, headers={"User-Agent": "OndeToBus/1.0 (projeto academico UFSM)"})
+    with urllib.request.urlopen(req, timeout=8) as resp:
         data = json.load(resp)
-    if data.get("code") != "Ok" or not data.get(key):
+    if data.get("code") != "Ok" or not data.get("routes"):
         return None
-    flat = []
-    for item in data[key]:
-        for lng, lat in item["geometry"]["coordinates"]:
-            flat.append([lat, lng])
-    return flat or None
+    return [[lat, lng] for lng, lat in data["routes"][0]["geometry"]["coordinates"]] or None
+
+
+def _load_disk_cache():
+    try:
+        return json.loads(PATH_CACHE_FILE.read_text())
+    except Exception:
+        return {}
 
 
 def snapped_path(line):
     raw = line.get("path") or []
     if len(raw) < 2:
         return raw
-    cached = _PATH_CACHE.get(line["id"])
+    lid = line["id"]
+    cached = _PATH_CACHE.get(lid)
     if cached:
         ts, path, ok = cached
         if ok or time.time() - ts < _RETRY_SECONDS:
             return path
-    for kind in ("match", "route"):
+    disk = _load_disk_cache().get(lid)
+    if disk and disk.get("raw") == raw:
+        _PATH_CACHE[lid] = (time.time(), disk["path"], True)
+        return disk["path"]
+    try:
+        result = _osrm(raw)
+    except Exception:
+        result = None
+    if result:
+        _PATH_CACHE[lid] = (time.time(), result, True)
         try:
-            result = _osrm(kind, raw)
-            if result:
-                _PATH_CACHE[line["id"]] = (time.time(), result, True)
-                return result
+            allc = _load_disk_cache()
+            allc[lid] = {"raw": raw, "path": result}
+            PATH_CACHE_FILE.write_text(json.dumps(allc))
         except Exception:
             pass
-    _PATH_CACHE[line["id"]] = (time.time(), raw, False)
+        return result
+    _PATH_CACHE[lid] = (time.time(), raw, False)
     return raw
+
+
+# --- Simulação do ônibus pela tabela de horários ----------------------------
+def _cum_dist(path):
+    key = id(path)
+    hit = _GEOM.get(key)
+    if hit:
+        return hit
+    cum = [0.0]
+    for (la1, lo1), (la2, lo2) in zip(path, path[1:]):
+        dx = (lo2 - lo1) * math.cos(math.radians((la1 + la2) / 2))
+        cum.append(cum[-1] + math.hypot(la2 - la1, dx))
+    _GEOM.clear()
+    _GEOM[key] = cum
+    return cum
+
+
+def point_at(path, frac):
+    """Ponto a `frac` (0..1) da distância total do traçado."""
+    cum = _cum_dist(path)
+    target = cum[-1] * max(0.0, min(1.0, frac))
+    lo, hi = 0, len(cum) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if cum[mid] <= target:
+            lo = mid
+        else:
+            hi = mid
+    seg = cum[hi] - cum[lo] or 1
+    t = (target - cum[lo]) / seg
+    (la1, lo1), (la2, lo2) = path[lo], path[hi]
+    return la1 + (la2 - la1) * t, lo1 + (lo2 - lo1) * t
+
+
+def simulated_bus(line, now=None):
+    """Viagem em andamento (UFSM → HCB) ou None. Só em dias úteis."""
+    now = now or datetime.now(TZ)
+    if now.weekday() > 4:
+        return None
+    m = now.hour * 60 + now.minute + now.second / 60
+    path = snapped_path(line)
+    for dep, arr, tag in TIMETABLE.get(line["id"], []):
+        if dep <= m <= arr:
+            lat, lng = point_at(path, (m - dep) / (arr - dep))
+            return {"lat": lat, "lng": lng, "trip": tag,
+                    "dep": f"{dep // 60}:{dep % 60:02d}", "arr": f"{arr // 60}:{arr % 60:02d}"}
+    return None
+
+
+def next_trip(line, now=None):
+    now = now or datetime.now(TZ)
+    if now.weekday() > 4:
+        return None
+    m = now.hour * 60 + now.minute
+    for dep, arr, tag in TIMETABLE.get(line["id"], []):
+        if dep > m:
+            return {"trip": tag, "dep": f"{dep // 60}:{dep % 60:02d}"}
+    return None
 
 
 STATUS_LABELS = {
@@ -190,8 +264,6 @@ def init_db():
     conn.commit()
 
     if fresh:
-        # Popula com um relato de exemplo (no primeiro ponto da linha)
-        # para o mapa não nascer vazio.
         now = time.time()
         for line in LINES:
             first = line["stops"][0]
@@ -199,7 +271,6 @@ def init_db():
                 "INSERT INTO reports (line_id, lat, lng, status, created_at) VALUES (?,?,?,?,?)",
                 (line["id"], first["lat"], first["lng"], "no_horario", now - 60),
             )
-        # Cartão de exemplo para testar a recarga simulada
         conn.execute(
             "INSERT OR IGNORE INTO cards (number, balance) VALUES (?, ?)",
             ("**** 4821", 12.40),
@@ -215,11 +286,7 @@ def index():
 
 @app.route("/sw.js")
 def service_worker():
-    # Servido na raiz (e não em /static/sw.js) de propósito: o "escopo"
-    # de um service worker por padrão é a pasta onde o arquivo está — se
-    # ficasse em /static/, ele só controlaria páginas dentro de /static/.
-    # Na raiz, ele controla o site inteiro (necessário pro app funcionar
-    # offline / abrir "por fora" como app instalado).
+    # Na raiz para o service worker controlar o site inteiro.
     response = send_from_directory(app.static_folder, "sw.js")
     response.headers["Cache-Control"] = "no-cache"
     response.headers["Content-Type"] = "application/javascript"
@@ -233,7 +300,8 @@ def api_lines():
 
 @app.route("/api/status")
 def api_status():
-    """Retorna a posição/status mais recente de cada linha."""
+    """Posição/status mais recente de cada linha (simulação tem prioridade
+    enquanto houver uma viagem da tabela em andamento)."""
     db = get_db()
     result = []
     for line in LINES:
@@ -246,6 +314,7 @@ def api_status():
             (line["id"], time.time() - 900),
         ).fetchone()["c"]
 
+        sim = simulated_bus(line)
         entry = {
             "id": line["id"],
             "name": line["name"],
@@ -258,7 +327,15 @@ def api_status():
             "lng": row["lng"] if row else None,
             "seconds_ago": int(time.time() - row["created_at"]) if row else None,
             "reporters": reporters,
+            "simulated": False,
+            "next_trip": next_trip(line),
         }
+        if sim:
+            entry.update(
+                status="no_horario",
+                status_label=f"No horário · viagem {sim['dep']}→{sim['arr']} ({sim['trip']})",
+                lat=sim["lat"], lng=sim["lng"], seconds_ago=0, simulated=True,
+            )
         result.append(entry)
     return jsonify(result)
 
@@ -335,8 +412,5 @@ def api_card():
 if __name__ == "__main__":
     init_db()
     porta = int(os.environ.get("PORT", 5000))
-    # DEBUG fica desligado por padrão (produção). Para testar localmente
-    # com o modo debug do Flask (recarrega sozinho, mostra stacktrace no
-    # navegador), rode com a variável de ambiente: FLASK_DEBUG=1
     modo_debug = os.environ.get("FLASK_DEBUG", "0") == "1"
     app.run(host="0.0.0.0", port=porta, debug=modo_debug)
