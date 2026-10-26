@@ -114,7 +114,7 @@ def _osrm(coords):
            f"{pts}?geometries=geojson&overview=full&continue_straight=true")
     req = urllib.request.Request(
         url, headers={"User-Agent": "OndeToBus/1.0 (projeto academico UFSM)"})
-    with urllib.request.urlopen(req, timeout=8) as resp:
+    with urllib.request.urlopen(req, timeout=12) as resp:
         data = json.load(resp)
     if data.get("code") != "Ok" or not data.get("routes"):
         return None
@@ -126,6 +126,14 @@ def _load_disk_cache():
         return json.loads(PATH_CACHE_FILE.read_text())
     except Exception:
         return {}
+
+
+def street_path(line):
+    """Só o traçado JÁ encaixado nas ruas; [] se o OSRM não respondeu
+    (melhor não desenhar do que desenhar uma linha fora das ruas)."""
+    snapped_path(line)
+    c = _PATH_CACHE.get(line["id"])
+    return c[1] if c and c[2] else []
 
 
 def snapped_path(line):
@@ -142,10 +150,14 @@ def snapped_path(line):
     if disk and disk.get("raw") == raw:
         _PATH_CACHE[lid] = (time.time(), disk["path"], True)
         return disk["path"]
-    try:
-        result = _osrm(raw)
-    except Exception:
-        result = None
+    result = None
+    for _ in range(2):
+        try:
+            result = _osrm(raw)
+        except Exception:
+            result = None
+        if result:
+            break
     if result:
         _PATH_CACHE[lid] = (time.time(), result, True)
         try:
@@ -197,7 +209,9 @@ def simulated_bus(line, now=None):
     if now.weekday() > 4:
         return None
     m = now.hour * 60 + now.minute + now.second / 60
-    path = snapped_path(line)
+    path = street_path(line)
+    if not path:
+        return None
     for dep, arr, tag in TIMETABLE.get(line["id"], []):
         if dep <= m <= arr:
             lat, lng = point_at(path, (m - dep) / (arr - dep))
@@ -295,7 +309,7 @@ def service_worker():
 
 @app.route("/api/lines")
 def api_lines():
-    return jsonify([{**l, "path": snapped_path(l)} for l in LINES])
+    return jsonify([{**l, "path": street_path(l)} for l in LINES])
 
 
 @app.route("/api/status")
@@ -320,7 +334,7 @@ def api_status():
             "name": line["name"],
             "color": line["color"],
             "stops": line.get("stops", []),
-            "path": snapped_path(line),
+            "path": street_path(line),
             "status": row["status"] if row else None,
             "status_label": STATUS_LABELS.get(row["status"]) if row else "Sem relatos",
             "lat": row["lat"] if row else None,
