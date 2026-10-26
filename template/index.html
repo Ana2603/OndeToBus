@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OndeTôBus</title>
+<style>
+  :root { --bg:#10141a; --panel:#0e1116; --accent:#f5b301; --green:#1B7F4B; --ink:#e8edf2; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--ink); min-height:100vh; display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; justify-content:space-between; padding:14px 28px; background:#0f1620; border-bottom:3px solid var(--accent); }
+  header h1 { margin:0; font-size:22px; letter-spacing:.5px; }
+  header h1 span { color:var(--accent); }
+  header small { display:block; color:#9fb0c0; font-size:13px; margin-top:2px; }
+  .btn { background:transparent; color:var(--accent); border:2px solid var(--accent); padding:10px 18px; border-radius:10px; font-weight:700; text-transform:uppercase; cursor:pointer; }
+  main { flex:1; display:grid; grid-template-columns: minmax(0,1fr) 400px; gap:18px; padding:18px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .mapbox { position:relative; background:#d6f5e4; border-radius:18px; overflow:hidden; min-height:420px; }
+  .mapbox svg { width:100%; height:100%; max-height:calc(100vh - 150px); display:block; }
+  .lbl { font:600 15px system-ui, sans-serif; fill:#6b7a76; letter-spacing:1px; }
+  .lbl.big { font-size:24px; fill:#2a2f2e; letter-spacing:0; }
+  .badge { font:700 13px system-ui; fill:#444; }
+  #bus { transition: transform 1s linear; }
+  .share { position:absolute; left:50%; bottom:16px; transform:translateX(-50%); background:#10141a; color:#fff; border:0; padding:14px 22px; border-radius:30px; font-weight:700; text-transform:uppercase; cursor:pointer; box-shadow:0 4px 14px #0006; }
+  aside { background:var(--panel); border-radius:18px; padding:20px; display:flex; flex-direction:column; gap:12px; }
+  aside h2 { margin:0; font-size:15px; color:var(--accent); display:flex; justify-content:space-between; }
+  .line { display:flex; gap:12px; align-items:center; padding:14px 0; border-bottom:1px solid #1d2530; }
+  .tag { border:2px solid #5b2a86; color:#fff; border-radius:10px; padding:8px 12px; text-align:center; font-size:12px; line-height:1.1; }
+  .tag b { display:block; font-size:22px; }
+  .info b { display:block; font-size:16px; }
+  .info span { color:#7be0a8; font-size:13px; }
+  .note { color:#7d8a98; font-size:12px; margin-top:auto; }
+  dialog { border:0; border-radius:14px; background:#171d26; color:var(--ink); padding:22px; }
+  dialog input { padding:10px; border-radius:8px; border:1px solid #334; background:#0e1116; color:#fff; width:100%; margin:10px 0; }
+  dialog::backdrop { background:#0008; }
+</style>
+</head>
+<body>
+<header>
+  <div><h1>ONDETÔ<span>BUS</span><small>rastreamento colaborativo · Cachoeira do Sul</small></h1></div>
+  <button class="btn" id="btnCard">Recarregar cartão</button>
+</header>
+
+<main>
+  <div class="mapbox">
+    <!-- Mapa desenhado em SVG (coordenadas = pixels da imagem de referência). Sem tiles, sem internet. -->
+    <svg id="map" viewBox="0 340 720 800" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Rota da linha 02, Hospital até UFSM">
+      <defs>
+        <pattern id="ruas" width="16" height="16" patternUnits="userSpaceOnUse">
+          <path d="M0 0H16M0 0V16" stroke="#d3ddda" stroke-width="1.2" fill="none"/>
+        </pattern>
+      </defs>
+      <rect x="0" y="340" width="720" height="800" fill="#d6f5e4"/>
+      <!-- rios -->
+      <path d="M0 1030 L90 1090 L150 1170 L210 1280" stroke="#8fd3ee" stroke-width="34" fill="none" stroke-linecap="round"/>
+      <path d="M590 1038 L720 1030 L720 1280 L640 1280 L570 1190 L560 1130 L580 1080 Z" fill="#8fd3ee"/>
+      <!-- mancha urbana -->
+      <path d="M215 470 L320 440 L420 560 L560 600 L720 640 L720 1000 L560 1005 L470 1090 L400 1000 L330 800 L300 640 L215 600 Z" fill="#eef3f1"/>
+      <path d="M215 470 L320 440 L420 560 L560 600 L720 640 L720 1000 L560 1005 L470 1090 L400 1000 L330 800 L300 640 L215 600 Z" fill="url(#ruas)"/>
+      <!-- rodovias -->
+      <path d="M270 340 L270 440 L300 520 L330 700 L400 900 L460 1100 L660 1190" stroke="#aebfd0" stroke-width="5" fill="none"/>
+      <path d="M720 330 L590 400 L410 570" stroke="#aebfd0" stroke-width="4" fill="none"/>
+      <g class="badge"><rect x="290" y="574" width="36" height="22" rx="6" fill="#fff" stroke="#555"/><text x="298" y="590">153</text>
+      <rect x="592" y="346" width="66" height="24" rx="6" fill="#fff" stroke="#555"/><text x="600" y="363">RS-403</text></g>
+      <!-- rótulos -->
+      <text class="lbl" x="305" y="372">MARINA</text>
+      <text class="lbl" x="314" y="546">MEDIANEIRA</text>
+      <text class="lbl" x="458" y="598">PONCHE VERDE</text>
+      <text class="lbl" x="296" y="699">SANTA HELENA</text>
+      <text class="lbl" x="348" y="827">GONÇALVES</text>
+      <text class="lbl" x="540" y="890">CENTRO</text>
+      <text class="lbl" x="580" y="442">VOLTA DA</text><text class="lbl" x="560" y="462">CHARQUEADA</text>
+      <text class="lbl" x="350" y="993">NOSSA SRA.</text><text class="lbl" x="358" y="1013">DE FATIMA</text>
+      <text class="lbl" x="495" y="1046">MARQUES</text><text class="lbl" x="503" y="1066">RIBEIRO</text>
+      <text class="lbl big" x="538" y="742">Cachoeira</text><text class="lbl big" x="560" y="772">do Sul</text>
+      <text class="lbl" x="100" y="1138" transform="rotate(62 100 1138)" fill="#4a90b0">Rio Jacuí</text>
+      <text x="74" y="818" font-size="22" fill="#3a6fb0" font-family="system-ui">Ulbra</text>
+      <text x="74" y="848" font-size="22" fill="#3a6fb0" font-family="system-ui">Cachoeira do Sul</text>
+
+      <!-- rota (preenchida pelo JS) -->
+      <polyline id="rota" fill="none" stroke="#0d5c35" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+      <polyline id="rota2" fill="none" stroke="#1B7F4B" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+      <g id="pontos" fill="#073d22"></g>
+      <g id="paradas"></g>
+      <!-- ônibus -->
+      <g id="bus" style="display:none">
+        <circle r="17" fill="#2f6bff" opacity=".25"/>
+        <circle r="10" fill="#2f6bff" stroke="#fff" stroke-width="3"/>
+      </g>
+    </svg>
+    <button class="share" id="btnShare">Estou num ônibus — compartilhar localização</button>
+  </div>
+
+  <aside>
+    <h2>PAINEL DE LINHAS <span id="hora"></span></h2>
+    <div id="linhas"></div>
+    <p class="note">Atualizado por passageiros em tempo real. Quanto mais gente reporta, mais confiável fica o dado. A posição mostrada durante as viagens da tabela é uma simulação.</p>
+  </aside>
+</main>
+
+<dialog id="dlg">
+  <form method="dialog">
+    <b>Recarga simulada</b> <small id="saldo"></small>
+    <input id="valor" type="number" min="1" max="200" step="0.01" placeholder="Valor (R$ 1 a 200)">
+    <button class="btn" value="ok" id="okRecarga">Recarregar</button>
+    <button class="btn" value="x" style="border-color:#556;color:#99a">Fechar</button>
+  </form>
+</dialog>
+
+<script>
+// Remove service worker / caches antigos que podem estar servindo a versão anterior do mapa.
+try {
+  navigator.serviceWorker && navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister()));
+  window.caches && caches.keys().then(ks => ks.forEach(k => caches.delete(k)));
+} catch (e) {}
+
+// lat/lng -> pixel do desenho (mesma calibração da imagem de referência)
+const px = (lat, lng) => [297 + (lng + 52.92924) * 24936, 441 + (-30.00680 - lat) * 28794];
+const $ = id => document.getElementById(id);
+let desenhou = false, linhaId = null;
+
+function desenharRota(l) {
+  const pts = l.path.map(p => px(p[0], p[1]));
+  const s = pts.map(p => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ");
+  $("rota").setAttribute("points", s);
+  $("rota2").setAttribute("points", s);
+  $("pontos").innerHTML = pts.map(p => `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="4"/>`).join("");
+  const stok = px(-30.00680, -52.92924), hcb = px(-30.02538, -52.91347);
+  $("paradas").innerHTML =
+    `<circle cx="${stok[0]}" cy="${stok[1]}" r="17" fill="#1a73e8" stroke="#fff" stroke-width="3"/>
+     <text x="${stok[0]}" y="${stok[1] + 6}" text-anchor="middle" font-size="17" fill="#fff">🛒</text>
+     <text x="${stok[0] - 160}" y="${stok[1] - 12}" font-size="24" fill="#1a73e8" font-family="system-ui">Stok Center</text>
+     <circle cx="${hcb[0]}" cy="${hcb[1]}" r="18" fill="#e53935" stroke="#fff" stroke-width="3"/>
+     <text x="${hcb[0]}" y="${hcb[1] + 7}" text-anchor="middle" font-size="20" font-weight="700" fill="#fff" font-family="system-ui">H</text>`;
+  desenhou = true;
+}
+
+async function atualizar() {
+  try {
+    const dados = await (await fetch("/api/status", { cache: "no-store" })).json();
+    const l = dados[0]; if (!l) return;
+    linhaId = l.id;
+    if (!desenhou && l.path && l.path.length) desenharRota(l);
+    const bus = $("bus");
+    if (l.lat != null) {
+      const [x, y] = px(l.lat, l.lng);
+      bus.style.display = ""; bus.style.transform = `translate(${x}px, ${y}px)`;
+    } else bus.style.display = "none";
+    const ago = l.seconds_ago == null ? "" : ` · há ${l.seconds_ago}s`;
+    $("linhas").innerHTML = `<div class="line">
+      <div class="tag">LINHA<b>${l.id}</b></div>
+      <div class="info"><b>Noêmia / Santa Helena / UFSM</b>
+      <span>${l.status_label}${ago}</span><br>
+      <small style="color:#8895a3">${l.reporters} relato(s) recente(s)${l.next_trip ? " · próxima: " + l.next_trip.dep : ""}</small></div></div>`;
+  } catch (e) {}
+}
+setInterval(() => $("hora").textContent = new Date().toLocaleTimeString("pt-BR"), 1000);
+atualizar(); setInterval(atualizar, 5000);
+
+$("btnShare").onclick = () => {
+  if (!navigator.geolocation) return alert("Geolocalização indisponível.");
+  navigator.geolocation.getCurrentPosition(async pos => {
+    await fetch("/api/report", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ line_id: linhaId || "02", lat: pos.coords.latitude, lng: pos.coords.longitude, status: "no_horario" }) });
+    atualizar();
+  }, () => alert("Não foi possível obter sua localização."));
+};
+
+$("btnCard").onclick = async () => {
+  const c = await (await fetch("/api/card")).json();
+  $("saldo").textContent = `· saldo R$ ${c.balance.toFixed(2)}`;
+  $("dlg").showModal();
+};
+$("okRecarga").onclick = async () => {
+  const amount = parseFloat($("valor").value);
+  const r = await fetch("/api/recharge", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ amount }) });
+  const j = await r.json();
+  alert(j.ok ? `Recarga simulada! Novo saldo: R$ ${j.new_balance.toFixed(2)}` : j.error);
+};
+</script>
+</body>
+</html>
