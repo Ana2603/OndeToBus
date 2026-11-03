@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OndeTôBus</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;700&family=Space+Mono&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#eef0f2; --dark:#14161b; --panel:#14161b; --accent:#f5b301; --ink:#e8edf2; --muted:#8a94a0; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, "Segoe UI", Roboto, sans-serif; background:var(--bg); min-height:100vh; display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; justify-content:space-between; padding:16px 28px; background:var(--dark); border-bottom:3px solid var(--accent); color:#fff; }
+  header h1 { margin:0; font:700 26px Oswald, sans-serif; letter-spacing:.5px; }
+  header h1 span { color:var(--accent); }
+  header small { display:block; color:#b4bfcb; font-size:14px; font-weight:400; font-family:system-ui; margin-top:2px; letter-spacing:0; }
+  .btn { background:transparent; color:var(--accent); border:2px solid var(--accent); padding:10px 18px; border-radius:10px; font:700 15px Oswald, sans-serif; text-transform:uppercase; cursor:pointer; }
+  .btn--solid { background:var(--accent); color:var(--dark); }
+  main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 400px; gap:18px; padding:18px; }
+  @media (max-width: 900px) { main { grid-template-columns:1fr; } }
+  .mapbox { position:relative; border-radius:18px; overflow:hidden; min-height:460px; height:calc(100vh - 140px); }
+  #map { position:absolute; inset:0; }
+  .share { position:absolute; left:50%; bottom:18px; transform:translateX(-50%); z-index:1000; background:var(--dark); color:#fff; border:0; padding:15px 26px; border-radius:40px; font:700 17px Oswald, sans-serif; text-transform:uppercase; cursor:pointer; box-shadow:0 4px 14px #0007; white-space:nowrap; }
+  .share::before { content:""; display:inline-block; width:10px; height:10px; border-radius:50%; background:#ff5a36; margin-right:12px; }
+  aside { background:var(--panel); border-radius:18px; color:var(--ink); display:flex; flex-direction:column; overflow:hidden; }
+  aside h2 { margin:0; padding:20px 22px; font:700 17px Oswald, sans-serif; color:var(--accent); display:flex; justify-content:space-between; border-bottom:1px solid #232831; text-transform:uppercase; }
+  aside h2 span { font:400 16px "Space Mono", monospace; color:#c8d0d8; }
+  #board-list { flex:1; padding:6px 22px; }
+  .board__row { display:grid; grid-template-columns:auto 1fr auto; gap:12px; align-items:center; padding:18px 0; border-bottom:1px solid #232831; }
+  .board__dot { width:11px; height:11px; border-radius:50%; }
+  .board__name { margin:0; font:700 18px Oswald, sans-serif; }
+  .board__meta { margin:4px 0 0; font:13px "Space Mono", monospace; color:var(--muted); }
+  .board__status { font:13px "Space Mono", monospace; padding:6px 10px; border-radius:6px; background:#243038; color:#8fa0ad; }
+  .board__status--no_horario { background:#12362a; color:#4ade9b; }
+  .board__status--atrasado { background:#3b2e10; color:#fbbf24; }
+  .board__status--quebrado { background:#3d1717; color:#f87171; }
+  .note { margin:0; padding:16px 22px; border-top:1px solid #232831; color:#7d8a98; font:13px "Space Mono", monospace; }
+  /* modais */
+  .overlay { position:fixed; inset:0; background:#000a; display:none; align-items:center; justify-content:center; z-index:3000; padding:16px; }
+  .overlay.is-open { display:flex; }
+  .modal { background:#1b2029; color:var(--ink); border-radius:16px; padding:24px; width:100%; max-width:440px; }
+  .modal h3 { margin:0 0 6px; font:700 20px Oswald, sans-serif; color:var(--accent); }
+  .modal p { margin:14px 0 8px; font-size:14px; color:#aab4be; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; }
+  .chip { background:#10141a; color:#fff; border:2px solid #3a4452; padding:9px 14px; border-radius:20px; cursor:pointer; font:600 14px system-ui; }
+  .chip.is-selected { background:var(--accent); color:var(--dark); border-color:var(--accent); }
+  .modal__actions { display:flex; gap:10px; margin-top:20px; }
+  .btn:disabled { opacity:.4; cursor:not-allowed; }
+  .modal__result { margin-top:12px; font-size:14px; min-height:18px; }
+  .modal__result.is-error { color:#f87171; }
+  .modal__result.is-success { color:#4ade9b; }
+  #geo-status { font-size:13px; color:#aab4be; margin-top:10px; }
+  .board__row--flicker { animation: fl .6s ease-out; }
+  @keyframes fl { from { opacity:.3; } to { opacity:1; } }
+</style>
+</head>
+<body>
+<header>
+  <div><h1>ONDETÔ<span>BUS</span><small>rastreamento colaborativo · Cachoeira do Sul</small></h1></div>
+  <button class="btn" id="open-recharge">Recarregar cartão</button>
+</header>
+
+<main>
+  <div class="mapbox">
+    <div id="map"></div>
+    <button class="share" id="open-report">Estou num ônibus — compartilhar localização</button>
+  </div>
+  <aside>
+    <h2>Painel de linhas <span id="clock">--:--:--</span></h2>
+    <div id="board-list"></div>
+    <p class="note">Atualizado por passageiros em tempo real. Quanto mais gente reporta, mais confiável fica o dado.</p>
+  </aside>
+</main>
+
+<div class="overlay" id="report-overlay">
+  <div class="modal">
+    <h3>Compartilhar localização</h3>
+    <p>Em qual linha você está?</p>
+    <div class="chips" id="line-chips"></div>
+    <p>Como está o ônibus?</p>
+    <div class="chips">
+      <button class="chip chip--status" data-status="no_horario">No horário</button>
+      <button class="chip chip--status" data-status="atrasado">Atrasado</button>
+      <button class="chip chip--status" data-status="quebrado">Quebrado</button>
+    </div>
+    <div id="geo-status"></div>
+    <div class="modal__actions">
+      <button class="btn btn--solid" id="submit-report" disabled>Enviar relato</button>
+      <button class="btn" data-close="report-overlay">Fechar</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="recharge-overlay">
+  <div class="modal">
+    <h3>Recarga simulada</h3>
+    <p>Saldo atual: <b id="card-balance">—</b> (cartão **** 4821)</p>
+    <p>Valor da recarga:</p>
+    <div class="chips" id="amount-chips">
+      <button class="chip" data-amount="10">R$ 10</button>
+      <button class="chip" data-amount="20">R$ 20</button>
+      <button class="chip" data-amount="50">R$ 50</button>
+    </div>
+    <div class="modal__result" id="recharge-result"></div>
+    <div class="modal__actions">
+      <button class="btn btn--solid" id="submit-recharge">Recarregar</button>
+      <button class="btn" data-close="recharge-overlay">Fechar</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// Remove service worker / caches antigos que possam estar servindo a versão anterior.
+try {
+  navigator.serviceWorker && navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister()));
+  window.caches && caches.keys().then(ks => ks.forEach(k => caches.delete(k)));
+} catch (e) {}
+</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="{{ url_for('static', filename='app.js') }}?v=3"></script>
+</body>
+</html>
