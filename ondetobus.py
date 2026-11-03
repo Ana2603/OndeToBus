@@ -142,8 +142,8 @@ def snapped_path(line):
         ts, path, ok = cached
         if ok or time.time() - ts < _RETRY_SECONDS:
             return path
-    # Poucos pontos precisos -> "route"; muitos pontos de um traçado -> "match"
-    for kind in (("match", "route") if custom else ("route",)):
+    # "route" passa por todos os pontos, na ordem; "match" é o plano B.
+    for kind in ("route", "match"):
         try:
             result = _osrm(kind, raw)
             if result:
@@ -240,7 +240,9 @@ def service_worker():
 
 @app.route("/api/lines")
 def api_lines():
-    return jsonify([{**l, "path": snapped_path(l)} for l in LINES])
+    return jsonify(
+        [{**l, "path": snapped_path(l), "waypoints": l.get("path", [])} for l in LINES]
+    )
 
 
 @app.route("/api/status")
@@ -264,6 +266,7 @@ def api_status():
             "color": line["color"],
             "stops": line.get("stops", []),
             "path": snapped_path(line),
+            "waypoints": line.get("path", []),
             "status": row["status"] if row else None,
             "status_label": STATUS_LABELS.get(row["status"]) if row else "Sem relatos",
             "lat": row["lat"] if row else None,
