@@ -1,11 +1,11 @@
 """
 OndeToBus — protótipo de rastreamento colaborativo de ônibus (Projeto Integrador I).
 A recarga de cartão é SIMULADA.
-
+ 
 Rodar:  pip install flask  &&  python ondetobus.py   ->  http://localhost:5000
 Variáveis opcionais: PORT, FLASK_DEBUG ("1" liga debug), DB_PATH.
 """
-
+ 
 import os
 import sqlite3
 import time
@@ -14,12 +14,12 @@ import urllib.request
 import threading
 from pathlib import Path
 from flask import Flask, jsonify, request, g, render_template, send_from_directory
-
+ 
 BASE_DIR = Path(__file__).parent
 DB_PATH = Path(os.environ.get("DB_PATH", BASE_DIR / "onibus.db"))
-
+ 
 app = Flask(__name__)
-
+ 
 # Linha 02 · Noêmia / Santa Helena / UFSM — com as DUAS viagens (rotas).
 # "stops" = pontos nomeados (como na primeira versão do mapa).
 # "routes" = traçados de cada viagem; os pontos são aproximados e o servidor
@@ -83,11 +83,11 @@ LINES = [
         ],
     },
 ]
-
+ 
 _PATH_CACHE = {}  # chave -> (timestamp, caminho, deu_certo)
 _RETRY_SECONDS = 300
-
-
+ 
+ 
 def _osrm(kind, coords):
     pts = ";".join(f"{lng},{lat}" for lat, lng in coords)
     base = "https://router.project-osrm.org"
@@ -108,11 +108,11 @@ def _osrm(kind, coords):
         for lng, lat in item["geometry"]["coordinates"]:
             flat.append([lat, lng])
     return flat or None
-
-
+ 
+ 
 _BUSY = set()
-
-
+ 
+ 
 def _worker(key, raw):
     result = None
     for kind in ("route", "match"):
@@ -127,8 +127,8 @@ def _worker(key, raw):
     else:
         _PATH_CACHE[key] = (time.time(), raw, False)
     _BUSY.discard(key)
-
-
+ 
+ 
 def snapped(key, raw):
     """Nunca bloqueia: devolve o traçado já encaixado (se existir) ou o bruto,
     e calcula o encaixe nas ruas em segundo plano. Retorna (caminho, encaixado?)."""
@@ -141,8 +141,8 @@ def snapped(key, raw):
         _BUSY.add(key)
         threading.Thread(target=_worker, args=(key, raw), daemon=True).start()
     return raw, False
-
-
+ 
+ 
 def line_routes(line):
     out = []
     for i, r in enumerate(line.get("routes", [])):
@@ -154,25 +154,25 @@ def line_routes(line):
             "snapped": ok,
         })
     return out
-
-
+ 
+ 
 STATUS_LABELS = {"no_horario": "No horário", "atrasado": "Atrasado", "quebrado": "Quebrado"}
-
-
+ 
+ 
 def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DB_PATH)
         g.db.row_factory = sqlite3.Row
     return g.db
-
-
+ 
+ 
 @app.teardown_appcontext
 def close_db(exception=None):
     db = g.pop("db", None)
     if db is not None:
         db.close()
-
-
+ 
+ 
 def init_db():
     fresh = not DB_PATH.exists()
     conn = sqlite3.connect(DB_PATH)
@@ -194,26 +194,26 @@ def init_db():
         conn.execute("INSERT OR IGNORE INTO cards (number, balance) VALUES (?, ?)", ("**** 4821", 12.40))
         conn.commit()
     conn.close()
-
-
+ 
+ 
 @app.route("/")
 def index():
     return render_template("index.html", lines=LINES)
-
-
+ 
+ 
 @app.route("/sw.js")
 def service_worker():
     response = send_from_directory(app.static_folder, "sw.js")
     response.headers["Cache-Control"] = "no-cache"
     response.headers["Content-Type"] = "application/javascript"
     return response
-
-
+ 
+ 
 @app.route("/api/lines")
 def api_lines():
     return jsonify([{**l, "routes": line_routes(l)} for l in LINES])
-
-
+ 
+ 
 @app.route("/api/status")
 def api_status():
     db = get_db()
@@ -240,8 +240,8 @@ def api_status():
             "reporters": reporters,
         })
     return jsonify(result)
-
-
+ 
+ 
 @app.route("/api/report", methods=["POST"])
 def api_report():
     data = request.get_json(force=True) or {}
@@ -260,8 +260,8 @@ def api_report():
     )
     db.commit()
     return jsonify({"ok": True})
-
-
+ 
+ 
 @app.route("/api/recharge", methods=["POST"])
 def api_recharge():
     """Recarga SIMULADA — nenhum pagamento real é processado."""
@@ -285,16 +285,18 @@ def api_recharge():
     db.commit()
     return jsonify({"ok": True, "simulated": True, "card_number": card_number,
                     "amount": amount, "new_balance": new_balance})
-
-
+ 
+ 
 @app.route("/api/card")
 def api_card():
     card_number = request.args.get("number", "**** 4821")
     row = get_db().execute("SELECT * FROM cards WHERE number = ?", (card_number,)).fetchone()
     return jsonify({"card_number": card_number, "balance": row["balance"] if row else 0})
-
-
+ 
+ 
+init_db()  # roda também sob gunicorn (Render), não só com "python ondetobus.py"
+ 
+ 
 if __name__ == "__main__":
-    init_db()
     porta = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=porta, debug=os.environ.get("FLASK_DEBUG", "0") == "1")
