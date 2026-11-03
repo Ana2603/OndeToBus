@@ -103,18 +103,21 @@ async function refreshBoard() {
 // ainda mostram apenas o ponto reportado, sem a linha da rota.
 function drawRoutes(lines) {
   lines.forEach((line) => {
-    if (!line.stops || line.stops.length < 2) return;
+    // Traçados das viagens (já encaixados nas ruas pelo servidor)
+    (line.routes || []).forEach((r) => {
+      if (!r.path || r.path.length < 2) return;
+      L.polyline(r.path, {
+        color: r.color || line.color,
+        weight: 4,
+        opacity: 0.6,
+        dashArray: "1, 8",
+        lineCap: "round",
+      })
+        .bindTooltip(r.name, { sticky: true })
+        .addTo(map);
+    });
 
-    const latlngs = line.stops.map((s) => [s.lat, s.lng]);
-    L.polyline(latlngs, {
-      color: line.color,
-      weight: 4,
-      opacity: 0.55,
-      dashArray: "1, 8",
-      lineCap: "round",
-    }).addTo(map);
-
-    line.stops.forEach((stop) => {
+    (line.stops || []).forEach((stop) => {
       L.circleMarker([stop.lat, stop.lng], {
         radius: 4,
         color: "#14161b",
