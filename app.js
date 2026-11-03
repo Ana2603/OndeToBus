@@ -27,9 +27,12 @@ document.addEventListener("DOMContentLoaded", async () => {
 
 function initMap() {
   map = L.map("map", { zoomControl: true }).setView([-30.0392, -52.8939], 14);
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  // Mapa "Voyager" (CARTO): mostra bem as ruas e os nomes, bem mais legível
+  // que o mapa padrão quando damos zoom na rota.
+  L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
     maxZoom: 19,
-    attribution: "&copy; OpenStreetMap",
+    subdomains: "abcd",
+    attribution: "&copy; OpenStreetMap contributors &copy; CARTO",
   }).addTo(map);
 }
 
@@ -98,34 +101,55 @@ async function refreshBoard() {
   });
 }
 
-// Desenha o traçado real de cada linha que já tem "stops" cadastrados
-// (pontos oficiais extraídos dos horários da TNSG). Linhas sem "stops"
-// ainda mostram apenas o ponto reportado, sem a linha da rota.
+// Desenha o traçado de cada linha como uma linha SÓLIDA que segue as ruas.
+// Usa "path" (traçado já encaixado nas ruas pelo servidor); se a linha não
+// tiver "path", cai para os pontos nomeados ("stops"). Os pontos nomeados
+// aparecem como marcadores com o nome do local.
 function drawRoutes(lines) {
-  lines.forEach((line) => {
-    if (!line.stops || line.stops.length < 2) return;
+  const bounds = [];
 
-    const latlngs = line.stops.map((s) => [s.lat, s.lng]);
-    L.polyline(latlngs, {
-      color: line.color,
-      weight: 4,
-      opacity: 0.55,
-      dashArray: "1, 8",
+  lines.forEach((line) => {
+    const stops = line.stops || [];
+    const path = line.path && line.path.length >= 2 ? line.path : stops.map((s) => [s.lat, s.lng]);
+    if (path.length < 2) return;
+
+    // contorno escuro por baixo + linha principal por cima (efeito "estrada")
+    L.polyline(path, {
+      color: "#0b3d24",
+      weight: 10,
+      opacity: 0.9,
+      lineJoin: "round",
       lineCap: "round",
     }).addTo(map);
+    L.polyline(path, {
+      color: line.color,
+      weight: 6,
+      opacity: 1,
+      lineJoin: "round",
+      lineCap: "round",
+    })
+      .bindTooltip(line.name, { sticky: true })
+      .addTo(map);
 
-    line.stops.forEach((stop) => {
+    path.forEach((p) => bounds.push(p));
+
+    stops.forEach((stop) => {
       L.circleMarker([stop.lat, stop.lng], {
-        radius: 4,
-        color: "#14161b",
-        weight: 1,
-        fillColor: line.color,
+        radius: 7,
+        color: "#ffffff",
+        weight: 2,
+        fillColor: "#0b3d24",
         fillOpacity: 1,
       })
-        .bindTooltip(stop.name, { direction: "top" })
+        .bindTooltip(stop.name, { permanent: true, direction: "right", offset: [8, 0] })
         .addTo(map);
     });
   });
+
+  // enquadra o mapa na rota, para as ruas aparecerem em detalhe
+  if (bounds.length) {
+    map.fitBounds(bounds, { padding: [40, 40] });
+  }
 }
 
 function formatAgo(seconds) {
