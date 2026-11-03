@@ -3,7 +3,9 @@
 // ============================================================
 let map;
 let markers = {}; // line_id -> L.Marker
-let routesDrawn = false; // as rotas (polylines) só precisam ser desenhadas uma vez
+let routesDrawn = false;
+let routesSnapped = false;
+let routeLayer; // as rotas (polylines) só precisam ser desenhadas uma vez
 let selectedLine = null;
 let selectedStatus = null;
 let userCoords = null;
@@ -16,13 +18,13 @@ const STATUS_ORDER = { atrasado: 0, quebrado: 0, no_horario: 1 };
 // ============================================================
 document.addEventListener("DOMContentLoaded", async () => {
   initMap();
-  await loadLines();
-  await refreshBoard();
-  setInterval(refreshBoard, 8000);
+  bindModals();
   tickClock();
   setInterval(tickClock, 1000);
-  bindModals();
-  await loadCard();
+  try { await loadLines(); } catch (e) { console.error(e); }
+  try { await refreshBoard(); } catch (e) { console.error(e); }
+  setInterval(() => refreshBoard().catch(console.error), 8000);
+  try { await loadCard(); } catch (e) { console.error(e); }
 });
 
 function initMap() {
@@ -31,6 +33,7 @@ function initMap() {
     maxZoom: 19,
     attribution: "&copy; OpenStreetMap",
   }).addTo(map);
+  routeLayer = L.layerGroup().addTo(map);
 }
 
 function tickClock() {
@@ -67,9 +70,12 @@ async function refreshBoard() {
   const res = await fetch("/api/status");
   const data = await res.json();
 
-  if (!routesDrawn) {
+  const allSnapped = data.every((l) => (l.routes || []).every((r) => r.snapped));
+  if (!routesDrawn || (allSnapped && !routesSnapped)) {
+    routeLayer.clearLayers();
     drawRoutes(data);
     routesDrawn = true;
+    routesSnapped = allSnapped;
   }
 
   data.sort((a, b) => (STATUS_ORDER[a.status] ?? 1) - (STATUS_ORDER[b.status] ?? 1));
@@ -114,7 +120,7 @@ function drawRoutes(lines) {
         lineCap: "round",
       })
         .bindTooltip(r.name, { sticky: true })
-        .addTo(map);
+        .addTo(routeLayer);
     });
 
     (line.stops || []).forEach((stop) => {
@@ -126,7 +132,7 @@ function drawRoutes(lines) {
         fillOpacity: 1,
       })
         .bindTooltip(stop.name, { direction: "top" })
-        .addTo(map);
+        .addTo(routeLayer);
     });
   });
 }
