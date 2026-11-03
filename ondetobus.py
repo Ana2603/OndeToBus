@@ -11,6 +11,7 @@ import sqlite3
 import time
 import json
 import urllib.request
+import threading
 from pathlib import Path
 from flask import Flask, jsonify, request, g, render_template, send_from_directory
 
@@ -98,7 +99,7 @@ def _osrm(kind, coords):
         url = f"{base}/route/v1/driving/{pts}?geometries=geojson&overview=full"
         key = "routes"
     req = urllib.request.Request(url, headers={"User-Agent": "OndeToBus/1.0 (projeto academico UFSM)"})
-    with urllib.request.urlopen(req, timeout=8) as resp:
+    with urllib.request.urlopen(req, timeout=5) as resp:
         data = json.load(resp)
     if data.get("code") != "Ok" or not data.get(key):
         return None
@@ -109,33 +110,48 @@ def _osrm(kind, coords):
     return flat or None
 
 
-def snapped(key, raw):
-    if len(raw) < 2:
-        return raw
-    cached = _PATH_CACHE.get(key)
-    if cached:
-        ts, path, ok = cached
-        if ok or time.time() - ts < _RETRY_SECONDS:
-            return path
+_BUSY = set()
+
+
+def _worker(key, raw):
+    result = None
     for kind in ("route", "match"):
         try:
             result = _osrm(kind, raw)
             if result:
-                _PATH_CACHE[key] = (time.time(), result, True)
-                return result
+                break
         except Exception:
             pass
-    _PATH_CACHE[key] = (time.time(), raw, False)
-    return raw
+    if result:
+        _PATH_CACHE[key] = (time.time(), result, True)
+    else:
+        _PATH_CACHE[key] = (time.time(), raw, False)
+    _BUSY.discard(key)
+
+
+def snapped(key, raw):
+    """Nunca bloqueia: devolve o traçado já encaixado (se existir) ou o bruto,
+    e calcula o encaixe nas ruas em segundo plano. Retorna (caminho, encaixado?)."""
+    if len(raw) < 2:
+        return raw, False
+    cached = _PATH_CACHE.get(key)
+    if cached and cached[2]:
+        return cached[1], True
+    if key not in _BUSY and (not cached or time.time() - cached[0] > _RETRY_SECONDS):
+        _BUSY.add(key)
+        threading.Thread(target=_worker, args=(key, raw), daemon=True).start()
+    return raw, False
 
 
 def line_routes(line):
     out = []
     for i, r in enumerate(line.get("routes", [])):
+        path, ok = snapped(f'{line["id"]}-{i}', r["path"])
         out.append({
             "name": r["name"],
             "color": r.get("color", line["color"]),
-            "path": snapped(f'{line["id"]}-{i}', r["path"]),
+            "path": path,
+            "snapped": ok,
         })
     return out
 
