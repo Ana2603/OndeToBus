@@ -104,8 +104,8 @@ LINES = [
             {"name": "Hospital de Caridade (H)", "lat": -30.04550, "lng": -52.89500},
         ],
         "routes": [
-            {"name": "UFSM → HCB", "color": "#1B7F4B", "addresses": UFSM_HCB},
-            {"name": "HCB → UFSM", "color": "#E67E22", "addresses": HCB_UFSM},
+            {"name": "UFSM → HCB", "color": "#1E6FE0", "addresses": UFSM_HCB},
+            {"name": "HCB → UFSM", "color": "#E8590C", "addresses": HCB_UFSM},
         ],
     },
 ]
@@ -120,11 +120,14 @@ VIEWBOX = "-52.97,-29.99,-52.86,-30.07"  # Cachoeira do Sul
 _GEO = {}      # endereço -> [lat, lng] ou None
 _ROUTES = {}   # chave -> {"path": [...], "stops": [...], "ready": True}
 _started = False
+CACHE_V = 3  # mude para forçar recalcular as rotas
 
 
 def _load_cache():
     try:
         data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        if data.get("v") != CACHE_V:
+            return
         _GEO.update(data.get("geo", {}))
         _ROUTES.update(data.get("routes", {}))
     except Exception:
@@ -133,7 +136,7 @@ def _load_cache():
 
 def _save_cache():
     try:
-        CACHE_FILE.write_text(json.dumps({"geo": _GEO, "routes": _ROUTES}), encoding="utf-8")
+        CACHE_FILE.write_text(json.dumps({"v": CACHE_V, "geo": _GEO, "routes": _ROUTES}), encoding="utf-8")
     except Exception:
         pass
 
@@ -154,29 +157,48 @@ def _nominatim(params):
     return None
 
 
+def _photon(q):
+    url = "https://photon.komoot.io/api/?" + urllib.parse.urlencode(
+        {"q": q, "lat": -30.03, "lon": -52.9, "limit": 3})
+    data = _get(url)
+    time.sleep(0.4)
+    for f in data.get("features", []):
+        lon, lat = f["geometry"]["coordinates"]
+        if -30.07 < lat < -29.99 and -52.97 < lon < -52.86:
+            return [lat, lon]
+    return None
+
+
+def _try(fn, *args):
+    for _ in range(2):
+        try:
+            return fn(*args)
+        except Exception:
+            time.sleep(3)
+    return None
+
+
+UFSM_FALLBACK = [-30.01397, -52.93531]
+
+
 def geocode(addr):
-    if addr in _GEO and _GEO[addr]:
+    if _GEO.get(addr):
         return _GEO[addr]
     if addr.startswith("UFSM"):
-        return [-30.01397, -52.93531] if "Casa" not in addr else [-30.01921, -52.93665]
+        res = _try(_nominatim, {"q": "Universidade Federal de Santa Maria, Cachoeira do Sul"})
+        _GEO[addr] = res or UFSM_FALLBACK
+        return _GEO[addr]
     rua, _, num = addr.partition(",")
     rua = rua.replace("Lib.", "Libero").strip()
     num = num.strip()
     base = {"city": "Cachoeira do Sul", "state": "Rio Grande do Sul", "country": "Brasil"}
     res = None
-    for params in (
-        {**base, "street": f"{num} {rua}"} if num else None,
-        {**base, "street": rua},
-        {"q": f"{rua}, Cachoeira do Sul, RS"},
-    ):
-        if not params:
-            continue
-        try:
-            res = _nominatim(params)
-        except Exception:
-            res = None
-        if res:
-            break
+    if num:
+        res = _try(_nominatim, {**base, "street": f"{num} {rua}"})
+    if not res:
+        res = _try(_photon, f"{rua} {num}, Cachoeira do Sul")
+    if not res:
+        res = _try(_nominatim, {**base, "street": rua})
     _GEO[addr] = res
     return res
 
@@ -188,17 +210,36 @@ def _dist_km(a, b):
     return math.hypot(dx, dy)
 
 
+def _limpar(stops):
+    """Remove paradas geocodificadas no lugar errado (picos que vão longe e voltam)."""
+    while len(stops) > 2:
+        worst, wv = None, 1.2
+        for i in range(1, len(stops) - 1):
+            a, b, c = stops[i - 1]["pt"], stops[i]["pt"], stops[i + 1]["pt"]
+            det = _dist_km(a, b) + _dist_km(b, c) - _dist_km(a, c)
+            if det > wv:
+                worst, wv = i, det
+        if worst is None:
+            break
+        del stops[worst]
+    while len(stops) > 2 and _dist_km(stops[-1]["pt"], stops[-2]["pt"]) > 2.5:
+        del stops[-1]
+    while len(stops) > 2 and _dist_km(stops[0]["pt"], stops[1]["pt"]) > 2.5:
+        del stops[0]
+    return stops
+
+
 def _build_route(key, route):
     stops = []
     for addr in route["addresses"]:
         pt = geocode(addr)
         if not pt:
             continue
-        if stops and _dist_km(stops[-1]["pt"], pt) > 3:   # descarta ponto fora do lugar
-            continue
         if stops and stops[-1]["pt"] == pt:                # mesmo ponto repetido
             continue
         stops.append({"label": addr, "pt": pt})
+    _save_cache()
+    stops = _limpar(stops)
     pts = [s["pt"] for s in stops]
     path = pts
     if len(pts) >= 2:
