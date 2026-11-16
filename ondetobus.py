@@ -145,26 +145,60 @@ def _length(p):
     return sum(_meters(a, b) for a, b in zip(p, p[1:]))
 
 
-def _osrm_match(raw):
-    step = max(40.0, _length(raw) / 90)
-    pts = _densify(raw, step)
-    while len(pts) > 100:
-        step *= 1.15
-        pts = _densify(raw, step)
+_LAST_SNAP_ERROR = {}
+
+
+def _osrm_call(kind, pts, radius=None):
     coords = ";".join(f"{lng:.5f},{lat:.5f}" for lat, lng in pts)
-    radii = ";".join("45" for _ in pts)
-    url = ("https://router.project-osrm.org/match/v1/driving/" + coords +
-           f"?geometries=geojson&overview=full&gaps=ignore&radiuses={radii}")
+    if kind == "match":
+        radii = ";".join(str(radius) for _ in pts)
+        url = ("https://router.project-osrm.org/match/v1/driving/" + coords +
+               f"?geometries=geojson&overview=full&gaps=ignore&radiuses={radii}")
+        key = "matchings"
+    else:
+        url = ("https://router.project-osrm.org/route/v1/driving/" + coords +
+               "?geometries=geojson&overview=full&continue_straight=true")
+        key = "routes"
     req = urllib.request.Request(
         url, headers={"User-Agent": "OndeToBus/1.0 (projeto academico UFSM)"})
     with urllib.request.urlopen(req, timeout=8) as resp:
         data = json.load(resp)
-    if data.get("code") != "Ok" or not data.get("matchings"):
-        return None
-    out = [[lat, lng] for m in data["matchings"]
-           for lng, lat in m["geometry"]["coordinates"]]
-    ratio = _length(out) / max(_length(raw), 1)
-    return out if 0.85 <= ratio <= 1.3 else None
+    if data.get("code") != "Ok" or not data.get(key):
+        raise RuntimeError(f"OSRM {kind}: {data.get('code')}")
+    return [[lat, lng] for item in data[key]
+            for lng, lat in item["geometry"]["coordinates"]]
+
+
+def _limit(pts, n=100):
+    step = 40.0
+    while len(pts) > n:
+        step *= 1.15
+        pts = _densify(pts, step)
+    return pts
+
+
+def _osrm_match(raw, lid="?"):
+    """Tenta, em ordem: match (raio 45 m), match (raio 100 m) e route com
+    pontos intermediários. Aceita só resultados com tamanho parecido com o
+    traçado original (evita desvios estranhos)."""
+    dense = _limit(_densify(raw, max(40.0, _length(raw) / 90)))
+    way = _limit(_densify(raw, max(60.0, _length(raw) / 45)), 60)
+    attempts = (("match45", lambda: _osrm_call("match", dense, 45)),
+                ("match100", lambda: _osrm_call("match", dense, 100)),
+                ("route", lambda: _osrm_call("route", way)))
+    errs = []
+    for name, fn in attempts:
+        try:
+            out = fn()
+            ratio = _length(out) / max(_length(raw), 1)
+            if 0.85 <= ratio <= 1.35:
+                _LAST_SNAP_ERROR.pop(lid, None)
+                return out
+            errs.append(f"{name}: tamanho estranho ({ratio:.2f}x)")
+        except Exception as e:
+            errs.append(f"{name}: {e}")
+    _LAST_SNAP_ERROR[lid] = " | ".join(errs)
+    return None
 
 
 def street_info(line):
@@ -185,7 +219,7 @@ def street_info(line):
     if len(raw) >= 2:
         for _ in range(1):
             try:
-                result = _osrm_match(raw)
+                result = _osrm_match(raw, lid)
             except Exception:
                 result = None
             if result:
@@ -349,7 +383,7 @@ def service_worker():
 @app.route("/api/lines")
 def api_lines():
     return jsonify([
-        {**l, "path": street_path(l), "snapped": street_info(l)[1],
+        {**l, "path": street_path(l), "snapped": street_info(l)[1], "snap_error": _LAST_SNAP_ERROR.get(l["id"]),
          "timetable": [[d, a, t] for d, a, t in TIMETABLE.get(l["id"], [])]}
         for l in LINES
     ])
