@@ -295,7 +295,7 @@ function formatMoney(value) {
 //
 // Opções na URL (para testar fora do horário / no fim de semana):
 //   ?t=14:07   finge que são 14:07 de um dia útil
-//   ?demo=1    um ônibus faz a viagem inteira a cada 60 segundos
+//   ?demo=1    demonstração em loop (ida e volta)
 // ============================================================
 const QS = new URLSearchParams(location.search);
 const FORCED_TIME = QS.get("t");
@@ -332,40 +332,65 @@ function densify(p, step) {
 // Encaixa o traçado nas ruas com o OSRM (gratuito, dados do OpenStreetMap).
 // Feito aqui no navegador e guardado no localStorage: só chama uma vez.
 // Se falhar, devolve null e o trajeto original (extraído da imagem) é usado.
+async function osrmCall(kind, pts, radius) {
+  const coords = pts.map((p) => p[1].toFixed(5) + "," + p[0].toFixed(5)).join(";");
+  const url = kind === "match"
+    ? "https://router.project-osrm.org/match/v1/driving/" + coords +
+      "?geometries=geojson&overview=full&gaps=ignore&radiuses=" + pts.map(() => radius).join(";")
+    : "https://router.project-osrm.org/route/v1/driving/" + coords +
+      "?geometries=geojson&overview=full&continue_straight=true";
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 12000);
+  try {
+    const j = await (await fetch(url, { signal: ctl.signal })).json();
+    const list = kind === "match" ? j.matchings : j.routes;
+    if (j.code !== "Ok" || !list || !list.length) throw new Error(j.code);
+    const out = [];
+    list.forEach((m) => m.geometry.coordinates.forEach((c) => out.push([c[1], c[0]])));
+    return out;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function limitPts(pts, max) {
+  let step = 40;
+  while (pts.length > max) {
+    step *= 1.15;
+    pts = densify(pts, step);
+  }
+  return pts;
+}
+
+// Encaixa o traçado nas ruas com o OSRM (gratuito, dados do OpenStreetMap).
+// Guarda o resultado no localStorage. Se tudo falhar, devolve null e o
+// trajeto original (extraído da imagem) continua sendo usado.
 async function snapToStreets(raw) {
-  const key = "ondetobus-snap-v2-" + JSON.stringify(raw).length;
+  const key = "ondetobus-snap-v3-" + JSON.stringify(raw).length;
   try {
     const cached = localStorage.getItem(key);
     if (cached) return JSON.parse(cached);
   } catch (e) {}
 
-  let step = Math.max(40, pathLength(raw) / 90);
-  let pts = densify(raw, step);
-  while (pts.length > 100) {
-    step *= 1.15;
-    pts = densify(raw, step);
+  const total = pathLength(raw);
+  const dense = limitPts(densify(raw, Math.max(40, total / 90)), 100);
+  const way = limitPts(densify(raw, Math.max(60, total / 45)), 60);
+  const attempts = [
+    () => osrmCall("match", dense, 45),
+    () => osrmCall("match", dense, 100),
+    () => osrmCall("route", way),
+  ];
+  for (const attempt of attempts) {
+    try {
+      const out = await attempt();
+      const ratio = pathLength(out) / total;
+      if (ratio >= 0.85 && ratio <= 1.35) {
+        try { localStorage.setItem(key, JSON.stringify(out)); } catch (e) {}
+        return out;
+      }
+    } catch (e) {}
   }
-  const coords = pts.map((p) => p[1].toFixed(5) + "," + p[0].toFixed(5)).join(";");
-  const radii = pts.map(() => 45).join(";");
-  const url =
-    "https://router.project-osrm.org/match/v1/driving/" + coords +
-    "?geometries=geojson&overview=full&gaps=ignore&radiuses=" + radii;
-  try {
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 12000);
-    const res = await fetch(url, { signal: ctl.signal });
-    clearTimeout(timer);
-    const j = await res.json();
-    if (j.code !== "Ok" || !j.matchings || !j.matchings.length) return null;
-    const out = [];
-    j.matchings.forEach((m) => m.geometry.coordinates.forEach((c) => out.push([c[1], c[0]])));
-    const ratio = pathLength(out) / pathLength(raw);
-    if (ratio < 0.85 || ratio > 1.3) return null; // resultado estranho: descarta
-    try { localStorage.setItem(key, JSON.stringify(out)); } catch (e) {}
-    return out;
-  } catch (e) {
-    return null;
-  }
+  return null;
 }
 
 function buildGeo(line, path) {
@@ -450,9 +475,53 @@ async function setupSimulation() {
   }
 }
 
-const DEMO_TRIP = [[600, 640, "Demonstração"]];
+// Demonstração (fora do horário / ?demo=1): ciclo de 5 minutos reais que
+// representam 50 minutos "de tabela" (10x mais rápido que o real).
+const DEMO_CYCLE_MS = 5 * 60 * 1000;
+const DEMO_SPAN_MIN = 50;
 function demoMinute() {
-  return 600 + 40 * ((Date.now() % 60000) / 60000);
+  return 600 + DEMO_SPAN_MIN * ((Date.now() % DEMO_CYCLE_MS) / DEMO_CYCLE_MS);
+}
+const DEMO_TRIPS = [
+  { dep: 600, arr: 640, tag: "Demonstração", dir: "ida" },
+  { dep: 610, arr: 650, tag: "Demonstração", dir: "volta" },
+];
+
+// A tabela traz só a saída da UFSM e a chegada ao HCB. A VOLTA (HCB -> UFSM)
+// é estimada: o ônibus que chega ao HCB volta em seguida, no mesmo tempo.
+function buildTrips(line) {
+  const trips = [];
+  (line.timetable || []).forEach(([dep, arr, tag]) => {
+    trips.push({ dep, arr, tag, dir: "ida" });
+    trips.push({ dep: arr, arr: arr + (arr - dep), tag, dir: "volta" });
+  });
+  return trips.sort((x, y) => x.dep - y.dep);
+}
+
+const DIR_LABEL = { ida: "UFSM → HCB", volta: "HCB → UFSM" };
+const DIR_COLOR = { ida: null, volta: "#E8590C" };
+
+// posição na rota (0 = UFSM, 1 = HCB) e próxima parada de uma viagem
+function tripState(line, geo, trip, mm) {
+  const f = (mm - trip.dep) / (trip.arr - trip.dep);
+  const pathFrac = trip.dir === "ida" ? f : 1 - f;
+  const stops = line.stops || [];
+  let next = -1;
+  if (trip.dir === "ida") {
+    next = stops.findIndex((_, i) => geo.stopFracs[i] > pathFrac + 1e-6);
+  } else {
+    for (let i = stops.length - 1; i >= 0; i--) {
+      if (geo.stopFracs[i] < pathFrac - 1e-6) { next = i; break; }
+    }
+  }
+  let text = "Chegando ao destino";
+  if (next >= 0) {
+    const t = trip.dir === "ida"
+      ? trip.dep + geo.stopFracs[next] * (trip.arr - trip.dep)
+      : trip.dep + (1 - geo.stopFracs[next]) * (trip.arr - trip.dep);
+    text = `Próxima parada: ${stops[next].name} · ${fmtMin(t)}`;
+  }
+  return { pathFrac, text };
 }
 
 function brNow() {
@@ -486,54 +555,51 @@ function tickSimulation() {
     const geo = routeGeo[line.id];
     if (!geo) return;
     let mm = m;
-    let trips = demo ? DEMO_TRIP : weekday ? line.timetable || [] : [];
-    let active = trips.filter(([dep, arr]) => mm >= dep && mm <= arr);
+    let trips = demo ? DEMO_TRIPS : weekday ? buildTrips(line) : [];
+    let active = trips.filter((t) => mm >= t.dep && mm <= t.arr);
     // Fora do horário das viagens (noite / fim de semana): mostra uma
-    // viagem de demonstração em loop, para o ônibus sempre aparecer andando.
+    // demonstração em loop, para os ônibus sempre aparecerem andando.
     const fake = !active.length && !demo && !FORCED_TIME;
-    const realNext = fake ? (weekday ? trips.find((t) => t[0] > m) : null) : null;
+    const realNext = fake && weekday ? trips.find((t) => t.dep > m) : null;
     if (fake) {
-      trips = DEMO_TRIP;
-      active = DEMO_TRIP;
+      trips = DEMO_TRIPS;
       mm = demoMinute();
+      active = trips.filter((t) => mm >= t.dep && mm <= t.arr);
     }
 
-    active.forEach(([dep, arr, tag]) => {
-      const key = line.id + "|" + dep;
+    const lines = [];
+    active.forEach((trip) => {
+      const key = line.id + "|" + trip.dir + "|" + trip.dep;
       alive.add(key);
-      const frac = (mm - dep) / (arr - dep);
-      const pos = pointAt(geo, frac);
-      const next = (line.stops || []).findIndex((_, i) => geo.stopFracs[i] > frac + 1e-6);
-      const nextTxt = next >= 0
-        ? `Próxima parada: ${line.stops[next].name} · ${fmtMin(dep + geo.stopFracs[next] * (arr - dep))}`
-        : "Chegando ao destino";
-      const label = `<strong>Linha ${line.id}</strong> · ${fake ? "demonstração" : tag}<br>Saiu ${fmtMin(dep)} → chega ${fmtMin(arr)}<br>${nextTxt}`;
+      const st = tripState(line, geo, trip, mm);
+      const pos = pointAt(geo, st.pathFrac);
+      const dirTxt = DIR_LABEL[trip.dir];
+      const label =
+        `<strong>Linha ${line.id}</strong> · ${dirTxt}${fake ? " (demonstração)" : ""}` +
+        `<br>${trip.tag} · ${fmtMin(trip.dep)} → ${fmtMin(trip.arr)}<br>${st.text}`;
       if (!simMarkers[key]) {
-        simMarkers[key] = L.marker(pos, { icon: busIcon(line.color), zIndexOffset: 1000 })
-          .addTo(map)
-          .bindPopup(label);
+        simMarkers[key] = L.marker(pos, {
+          icon: busIcon(DIR_COLOR[trip.dir] || line.color),
+          zIndexOffset: 1000,
+        }).addTo(map).bindPopup(label);
       } else {
         simMarkers[key].setLatLng(pos);
         simMarkers[key].getPopup().setContent(label);
       }
+      lines.push(`🚌 ${dirTxt}: ${st.text}`);
     });
 
     const el = document.getElementById("next-stop-" + line.id);
     if (el) {
-      if (active.length) {
-        const [dep, arr] = active[0];
-        const frac = (mm - dep) / (arr - dep);
-        const next = (line.stops || []).findIndex((_, i) => geo.stopFracs[i] > frac + 1e-6);
-        const txt = next >= 0
-          ? `🚌 Próxima parada: ${line.stops[next].name} · ${fmtMin(dep + geo.stopFracs[next] * (arr - dep))}`
-          : "🚌 Chegando ao destino";
-        el.textContent = fake
-          ? `🎬 Demonstração (sem viagens agora${realNext ? ", próxima saída real " + fmtMin(realNext[0]) : ""}) · ${txt}`
-          : txt;
+      if (lines.length) {
+        const head = fake
+          ? `🎬 Demonstração (sem viagens agora${realNext ? ", próxima saída real " + fmtMin(realNext.dep) : ""})`
+          : "";
+        el.innerHTML = (head ? head + "<br>" : "") + lines.join("<br>");
       } else {
-        const nx = weekday ? trips.find((t) => t[0] > mm) : null;
+        const nx = weekday ? trips.find((t) => t.dep > mm) : null;
         el.textContent = nx
-          ? `Próxima saída da UFSM: ${fmtMin(nx[0])}`
+          ? `Próxima saída (${DIR_LABEL[nx.dir]}): ${fmtMin(nx.dep)}`
           : weekday ? "Sem mais viagens hoje" : "Sem viagens no fim de semana (tabela de dias úteis)";
       }
     }
