@@ -413,10 +413,14 @@ function buildGeo(line, path) {
       const d = Math.hypot(px - (ax + vx * t), py - (ay + vy * t));
       if (d < best.d) best = { d, seg: i, along: cum[i] + t * (cum[i + 1] - cum[i]) };
     }
-    fromSeg = best.seg;
-    stopFracs.push(total ? best.along / total : 0);
+    if (best.d <= 320) {
+      fromSeg = best.seg;
+      stopFracs.push(total ? best.along / total : 0);
+    } else {
+      stopFracs.push(NaN); // parada fora deste traçado (ex.: só a ida passa por ela)
+    }
   });
-  if (stopFracs.length) { stopFracs[0] = 0; stopFracs[stopFracs.length - 1] = 1; }
+  if (stopFracs.length) { stopFracs[0] = 0; stopFracs[stopFracs.length - 1] = 1; } // UFSM e HCB = pontas
   return { path, cum, stopFracs };
 }
 
@@ -447,30 +451,43 @@ function busIcon(color) {
   return L.divIcon({ html: svg, className: "", iconSize: [40, 40], iconAnchor: [20, 20] });
 }
 
+const VOLTA_COLOR = "#E8590C"; // linha e ônibus da volta (HCB -> UFSM)
+
 async function setupSimulation() {
-  const polylines = {};
+  const layers = {};
   linesData.forEach((line) => {
-    const raw = line.path || [];
-    if (raw.length < 2) return;
-    routeGeo[line.id] = buildGeo(line, raw);
-    polylines[line.id] = [
-      L.polyline(raw, { color: "#ffffff", weight: 9, opacity: 0.9 }).addTo(routeLayer),
-      L.polyline(raw, { color: line.color, weight: 5, opacity: 0.95 }).addTo(routeLayer),
+    const ida = line.path || [];
+    if (ida.length < 2) return;
+    const volta = line.path_volta && line.path_volta.length > 1 ? line.path_volta : ida;
+    routeGeo[line.id] = { ida: buildGeo(line, ida), volta: buildGeo(line, volta) };
+    layers[line.id] = { ida: [], volta: [] };
+    // volta primeiro (mais larga, por baixo) e ida por cima: onde as duas
+    // passam pela mesma rua, aparece o verde com borda laranja.
+    if (volta !== ida) {
+      layers[line.id].volta = [
+        L.polyline(volta, { color: "#ffffff", weight: 10, opacity: 0.9 }).addTo(routeLayer),
+        L.polyline(volta, { color: VOLTA_COLOR, weight: 7, opacity: 0.95 }).addTo(routeLayer),
+      ];
+    }
+    layers[line.id].ida = [
+      L.polyline(ida, { color: line.color, weight: 4, opacity: 1 }).addTo(routeLayer),
     ];
   });
-  const first = Object.values(polylines)[0];
-  if (first) map.fitBounds(first[1].getBounds(), { padding: [30, 30] });
+  const firstLine = linesData.find((l) => layers[l.id]);
+  if (firstLine) {
+    map.fitBounds(L.polyline(firstLine.path).getBounds(), { padding: [30, 30] });
+  }
 
   tickSimulation();
   setInterval(tickSimulation, 1000);
 
-  // em segundo plano: troca o traçado pelo encaixado nas ruas
+  // Só se os traçados NÃO vierem prontos das ruas: tenta encaixar via OSRM.
   for (const line of linesData) {
-    if (!routeGeo[line.id] || line.snapped) continue; // servidor já encaixou nas ruas
+    if (!routeGeo[line.id] || line.snapped || line.street_ready) continue;
     const snapped = await snapToStreets(line.path);
     if (snapped) {
-      routeGeo[line.id] = buildGeo(line, snapped);
-      polylines[line.id].forEach((pl) => pl.setLatLngs(snapped));
+      routeGeo[line.id].ida = buildGeo(line, snapped);
+      layers[line.id].ida.forEach((pl) => pl.setLatLngs(snapped));
     }
   }
 }
@@ -499,7 +516,7 @@ function buildTrips(line) {
 }
 
 const DIR_LABEL = { ida: "UFSM → HCB", volta: "HCB → UFSM" };
-const DIR_COLOR = { ida: null, volta: "#E8590C" };
+const DIR_COLOR = { ida: null, volta: VOLTA_COLOR };
 
 // posição na rota (0 = UFSM, 1 = HCB) e próxima parada de uma viagem
 function tripState(line, geo, trip, mm) {
@@ -552,8 +569,8 @@ function tickSimulation() {
   const alive = new Set();
 
   linesData.forEach((line) => {
-    const geo = routeGeo[line.id];
-    if (!geo) return;
+    const geos = routeGeo[line.id];
+    if (!geos) return;
     let mm = m;
     let trips = demo ? DEMO_TRIPS : weekday ? buildTrips(line) : [];
     let active = trips.filter((t) => mm >= t.dep && mm <= t.arr);
@@ -571,6 +588,7 @@ function tickSimulation() {
     active.forEach((trip) => {
       const key = line.id + "|" + trip.dir + "|" + trip.dep;
       alive.add(key);
+      const geo = geos[trip.dir];
       const st = tripState(line, geo, trip, mm);
       const pos = pointAt(geo, st.pathFrac);
       const dirTxt = DIR_LABEL[trip.dir];
