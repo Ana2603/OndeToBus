@@ -283,16 +283,111 @@ def start_routes():
     threading.Thread(target=_worker, daemon=True).start()
 
 
+# --- Trechos a remover (laços / ganchos) ----------------------------------
+# Locais marcados no mapa onde o traçado entra numa rua lateral e volta
+# (por causa de paradas geocodificadas em ruas laterais). Em cada local o
+# servidor procura o desvio (um trecho que sai da rua principal e volta perto
+# do mesmo ponto) e o apaga, ligando direto os dois lados.
+# lat/lng = centro da marcação, r = raio em metros.
+LIMPAR_TRECHOS = [
+    {"nome": "gancho Rodovia/BR-153", "lat": -30.006059, "lng": -52.932795, "r": 161},
+    {"nome": "laco Noemia", "lat": -30.007971, "lng": -52.93111, "r": 230},
+    {"nome": "laco Drews (praca)", "lat": -30.015152, "lng": -52.920299, "r": 206},
+    {"nome": "desvio Tibirica", "lat": -30.017198, "lng": -52.92491, "r": 257},
+    {"nome": "laco Rio Branco", "lat": -30.021845, "lng": -52.913479, "r": 283},
+    {"nome": "gancho Goncalves", "lat": -30.02109, "lng": -52.91778, "r": 189},
+]
+_LIMPO = {}  # cache: (chave, tamanho, 1º ponto, último ponto) -> (path, stops)
+
+
+def _xy(p, lat0, lng0):
+    import math
+    return ((p[1] - lng0) * 111320.0 * math.cos(math.radians(lat0)), (p[0] - lat0) * 111320.0)
+
+
+def _tirar_desvios(path, spots=None, max_iter=2):
+    """Apaga, perto de cada local marcado, o desvio de maior 'sobra' (trecho
+    muito mais longo que a distância em linha reta entre sua entrada e saída)."""
+    import math
+    spots = LIMPAR_TRECHOS if spots is None else spots
+    p = [list(q) for q in path]
+    if len(p) < 6:
+        return p
+    for sp in spots:
+        for _ in range(max_iter):
+            n = len(p)
+            lat0, lng0 = sp["lat"], sp["lng"]
+            xy = [_xy(q, lat0, lng0) for q in p]
+            cum = [0.0]
+            for i in range(1, n):
+                cum.append(cum[-1] + math.dist(xy[i - 1], xy[i]))
+            R = sp["r"]
+            dist_c = [math.hypot(x, y) for x, y in xy]
+            idx = [i for i in range(n) if dist_c[i] <= R + 40]
+            best = None
+            for a, i in enumerate(idx):
+                for j in idx[a + 3:]:
+                    d = math.dist(xy[i], xy[j])
+                    L = cum[j] - cum[i]
+                    if d > 200 or L > 700 or L < d + 90 or L < 1.8 * d:
+                        continue
+                    if sum(1 for k in range(i + 1, j) if dist_c[k] <= R) < 3:
+                        continue
+                    key = (round((L - d) / 15.0), -L)
+                    if best is None or key > best[0]:
+                        best = (key, i, j)
+            if best is None:
+                break
+            _, i, j = best
+            p = p[:i + 1] + p[j:]
+    return p
+
+
+def _nearest_on(path, pt):
+    best, bd = None, 1e18
+    for q in path:
+        d = _dist_km(q, pt)
+        if d < bd:
+            best, bd = q, d
+    return best, bd * 1000.0
+
+
+def _limpar_rota(key, c):
+    """Aplica _tirar_desvios ao traçado e reposiciona paradas que ficaram fora."""
+    path = c.get("path", [])
+    if len(path) < 6 or not c.get("ready"):
+        return path, c.get("stops", [])
+    ck = (key, len(path), tuple(path[0]), tuple(path[-1]))
+    if ck in _LIMPO:
+        return _LIMPO[ck]
+    clean = _tirar_desvios(path)
+    stops = []
+    for s in c.get("stops", []):
+        pt = [s["lat"], s["lng"]]
+        near_spot = any(_dist_km(pt, [sp["lat"], sp["lng"]]) * 1000 <= sp["r"] + 60 for sp in LIMPAR_TRECHOS)
+        if near_spot:
+            q, d = _nearest_on(clean, pt)
+            if q is not None and 30 < d < 300:       # parada ficou fora da rota: encosta nela
+                s = {**s, "lat": q[0], "lng": q[1]}
+        stops.append(s)
+    _LIMPO.clear() if len(_LIMPO) > 20 else None
+    _LIMPO[ck] = (clean, stops)
+    return clean, stops
+
+
+
 def line_routes(line):
     start_routes()
     out = []
     for i, r in enumerate(line.get("routes", [])):
-        c = _ROUTES.get(f'{line["id"]}-{i}', {})
+        key = f'{line["id"]}-{i}'
+        c = _ROUTES.get(key, {})
+        path, stops = _limpar_rota(key, c)
         out.append({
             "name": r["name"],
             "color": r.get("color", line["color"]),
-            "path": c.get("path", []),
-            "stops": c.get("stops", []),
+            "path": path,
+            "stops": stops,
             "ready": bool(c.get("ready")),
         })
     return out
