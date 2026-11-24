@@ -9,7 +9,7 @@ Variáveis opcionais: PORT, FLASK_DEBUG ("1" liga debug), DB_PATH.
 import os
 import sqlite3
 import time
-import json
+import json, math, hashlib
 import urllib.request
 import threading
 import urllib.parse
@@ -104,8 +104,8 @@ LINES = [
             {"name": "Hospital de Caridade (H)", "lat": -30.04550, "lng": -52.89500},
         ],
         "routes": [
-            {"name": "UFSM → HCB", "color": "#1E6FE0", "addresses": UFSM_HCB},
-            {"name": "HCB → UFSM", "color": "#E8590C", "addresses": HCB_UFSM},
+            {"code": "002A", "name": "002A · UFSM → Rodoviária → HCB", "color": "#1E6FE0", "addresses": UFSM_HCB},
+            {"code": "002B", "name": "002B · HCB → Rodoviária → UFSM", "color": "#E8590C", "addresses": HCB_UFSM},
         ],
     },
 ]
@@ -268,6 +268,9 @@ def _worker():
             key = f'{line["id"]}-{i}'
             if _ROUTES.get(key, {}).get("ready"):
                 continue
+            dr = _drawn()
+            if key in dr and key not in {v.get("frame") for v in dr.values()}:
+                continue                     # já tem rota gravada: não perde tempo geocodificando
             try:
                 _build_route(key, r)
             except Exception:
@@ -376,19 +379,248 @@ def _limpar_rota(key, c):
 
 
 
+# --- Rotas gravadas (traçadas a partir das fotos do app) --------------------
+# rotas_desenhadas.json (raiz do projeto): "02-0" = 002A (UFSM → HCB), "02-1" = 002B (HCB → UFSM).
+# Carregam na hora, sem geocodificar endereço nem chamar o OSRM para desenhar.
+# "snap": o servidor ainda alinha/encaixa nas ruas em segundo plano (e o mapa se atualiza sozinho).
+# "frame": rotas com a mesma moldura recebem o mesmo deslocamento de alinhamento.
+DRAWN_COMMITTED = BASE_DIR / "rotas_desenhadas.json"
+_DRAWN = {"sig": None, "data": {}}
+
+
+def _drawn():
+    sig = []
+    for f in (DRAWN_COMMITTED,):
+        try:
+            st = f.stat()
+            sig.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            sig.append(None)
+    if sig != _DRAWN["sig"]:
+        data = {}
+        for f in (DRAWN_COMMITTED,):
+            try:
+                data.update(json.loads(f.read_text(encoding="utf-8")))
+            except Exception:
+                pass
+        _DRAWN["sig"], _DRAWN["data"] = sig, data
+    return _DRAWN["data"]
+
+
+# ---- encaixe automático de rotas desenhadas ("snap": true) nas ruas, em segundo plano ----
+_SNAP = {}          # chave -> {"sig": str, "path": [...] | None}
+_SNAP_FILE = DB_PATH.parent / "snap_cache.json"
+
+
+def _hav(a, b):
+    return 111320 * math.hypot(b[0] - a[0], (b[1] - a[1]) * math.cos(math.radians(a[0])))
+
+
+def _densify(path, step=25):
+    out = [path[0]]
+    for a, b in zip(path, path[1:]):
+        n = max(1, int(_hav(a, b) // step))
+        for k in range(1, n + 1):
+            out.append([a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n])
+    return out
+
+
+def _dist_to(path, pt):
+    best = 1e12
+    for a, b in zip(path, path[1:]):
+        k = math.cos(math.radians(pt[0]))
+        ax, ay, bx, by, px, py = a[1] * k, a[0], b[1] * k, b[0], pt[1] * k, pt[0]
+        dx, dy = bx - ax, by - ay
+        t = 0 if dx == dy == 0 else max(0, min(1, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+        best = min(best, 111320 * math.hypot(px - (ax + t * dx), py - (ay + t * dy)))
+    return best
+
+
+def _length(p):
+    return sum(_hav(a, b) for a, b in zip(p, p[1:]))
+
+
+def _align(path, old, span=700, step=15):
+    """Desliza a rota desenhada (sem girar nem mudar o tamanho) até ela encaixar nas ruas da rota
+    automática (que vem do OSRM, ou seja, está em cima das ruas reais). Só confia nos trechos
+    parecidos: a média considera os 55% de pontos mais próximos."""
+    lat0 = path[0][0]
+    ky, kx = 111320.0, 111320.0 * math.cos(math.radians(lat0))
+    ref = _densify(old, 10)
+    cell = 30
+    grid = {}
+    for q in ref:
+        grid.setdefault((int(q[1] * kx // cell), int(q[0] * ky // cell)), []).append((q[1] * kx, q[0] * ky))
+    mine = [(q[1] * kx, q[0] * ky) for q in _densify(path, 40)]
+
+    def cost(dx, dy):
+        ds = []
+        for x, y in mine:
+            x += dx; y += dy
+            cx, cy = int(x // cell), int(y // cell)
+            best = 1e9
+            for gx in range(cx - 3, cx + 4):
+                for gy in range(cy - 3, cy + 4):
+                    for rx, ry in grid.get((gx, gy), ()):
+                        d = (rx - x) ** 2 + (ry - y) ** 2
+                        if d < best:
+                            best = d
+            ds.append(min(math.sqrt(best), 100.0))
+        ds.sort()
+        k = max(1, int(len(ds) * 0.55))
+        return sum(ds[:k]) / k + 0.004 * math.hypot(dx, dy)
+
+    best = (cost(0, 0), 0, 0)
+    for r, st in ((span, step), (step * 2, 4)):
+        c0 = (best[1], best[2])
+        for i in range(-int(r // st), int(r // st) + 1):
+            for j in range(-int(r // st), int(r // st) + 1):
+                dx, dy = c0[0] + i * st, c0[1] + j * st
+                c = cost(dx, dy)
+                if c < best[0]:
+                    best = (c, dx, dy)
+    c, dx, dy = best
+    print(f"alinhamento: desloca {dx:.0f} m (leste) {dy:.0f} m (norte); erro médio {c:.1f} m")
+    return [[q[0] + dy / ky, q[1] + dx / kx] for q in path], c
+
+
+_SHIFT = {}                 # chave da "moldura" -> {"sig", "d": (dlat, dlng) | None}
+_LOCK = threading.Lock()
+
+
+def _md5(obj):
+    return hashlib.md5(json.dumps(obj).encode()).hexdigest()
+
+
+def _cache_read():
+    try:
+        return json.loads(_SNAP_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _cache_put(k, v):
+    try:
+        c = _cache_read()
+        c[k] = v
+        _SNAP_FILE.write_text(json.dumps(c), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _shift_for(fkey, fpath):
+    """Quanto deslocar o desenho (lat, lng) para encaixar nas ruas reais.
+    Calculado uma vez com a rota automática (OSRM) da moldura; vale para todas as rotas dela."""
+    sig = _md5(fpath)
+    with _LOCK:
+        c = _SHIFT.get(fkey) or _cache_read().get("shift:" + fkey)
+        if c and c.get("sig") == sig:
+            _SHIFT[fkey] = c
+            return c.get("d")
+        for _ in range(60):                       # espera a rota automática ficar pronta (até ~2 min)
+            if _ROUTES.get(fkey, {}).get("ready"):
+                break
+            time.sleep(2)
+        old = _ROUTES.get(fkey, {}).get("path") or []
+        d = None
+        if len(old) > 5:
+            moved, err = _align(fpath, old)
+            if err <= 25:
+                d = [moved[0][0] - fpath[0][0], moved[0][1] - fpath[0][1]]
+            else:
+                print("alinhamento ruim, mantendo posição original")
+            c = {"sig": sig, "d": d}
+            _SHIFT[fkey] = c
+            _cache_put("shift:" + fkey, c)
+        return d
+
+
+def _publish(key, sig, path):
+    rev = (_SNAP.get(key) or {}).get("rev", 0) + 1
+    _SNAP[key] = {"sig": sig, "path": path, "rev": rev, "busy": True}
+    return rev
+
+
+def _snap_job(key, d, sig):
+    drawn = _drawn()
+    path = d["path"]
+    try:
+        fkey = d.get("frame") or key
+        fpath = (drawn.get(fkey) or d)["path"]
+        shift = _shift_for(fkey, fpath)
+        if shift:
+            path = [[a + shift[0], b + shift[1]] for a, b in path]
+            _publish(key, sig, path)              # já mostra o desenho alinhado
+        raw = _densify(path)
+        out = []
+        for i in range(0, len(raw) - 1, 80):
+            chunk = raw[i:i + 81]
+            if len(chunk) < 2:
+                break
+            coords = ";".join(f"{p[1]:.6f},{p[0]:.6f}" for p in chunk)
+            url = ("https://router.project-osrm.org/match/v1/driving/" + coords +
+                   "?geometries=geojson&overview=full&gaps=ignore&radiuses=" + ";".join(["45"] * len(chunk)))
+            j = _get(url)
+            if j.get("code") != "Ok":
+                raise ValueError(j.get("code"))
+            for m in j["matchings"]:
+                out.extend([c[1], c[0]] for c in m["geometry"]["coordinates"])
+        # conferência: só vale se ficou perto do desenho e sem desvios longos
+        ok = len(out) > 2 and 0.85 <= _length(out) / max(_length(raw), 1) <= 1.3
+        if ok:
+            ok = max(_dist_to(raw, q) for q in out[::3]) <= 90
+        final = out if ok else path
+    except Exception as e:
+        print("encaixe falhou:", key, e)
+        final = path
+    rev = (_SNAP.get(key) or {}).get("rev", 0) + 1
+    _SNAP[key] = {"sig": sig, "path": final, "rev": rev, "busy": False}
+    _cache_put(key, {"sig": sig, "path": final, "rev": rev})
+
+
+def _snapped(key, d):
+    """(caminho, revisão). Mostra o desenho na hora; o encaixe nas ruas chega depois, em segundo plano."""
+    sig = _md5(d["path"])
+    st = _SNAP.get(key)
+    if st is None:
+        c = _cache_read().get(key)
+        if c and c.get("sig") == sig:
+            st = _SNAP[key] = {**c, "busy": False}
+    if st and st.get("sig") == sig:
+        return st["path"], st.get("rev", 0)
+    _SNAP[key] = {"sig": sig, "path": d["path"], "rev": 0, "busy": True}
+    threading.Thread(target=_snap_job, args=(key, d, sig), daemon=True).start()
+    return d["path"], 0
+
+
 def line_routes(line):
     start_routes()
     out = []
     for i, r in enumerate(line.get("routes", [])):
         key = f'{line["id"]}-{i}'
         c = _ROUTES.get(key, {})
-        path, stops = _limpar_rota(key, c)
+        d = _drawn().get(key)
+        rev = 0
+        if d and len(d.get("path", [])) >= 2:                 # rota gravada em rotas_desenhadas.json
+            c = {"ready": True}
+            stops = d.get("stops", [])
+            if d.get("snap"):
+                path, rev = _snapped(key, d)
+                if len(stops) >= 2:                           # as paradas acompanham as pontas da rota
+                    stops = [dict(stops[0], lat=path[0][0], lng=path[0][1]),
+                             dict(stops[-1], lat=path[-1][0], lng=path[-1][1])]
+            else:
+                path = d["path"]
+        else:
+            path, stops = _limpar_rota(key, c)
         out.append({
             "name": r["name"],
+            "code": r.get("code", ""),
             "color": r.get("color", line["color"]),
             "path": path,
             "stops": stops,
             "ready": bool(c.get("ready")),
+            "rev": rev,
         })
     return out
 
