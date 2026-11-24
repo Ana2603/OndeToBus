@@ -440,7 +440,7 @@ def _length(p):
     return sum(_hav(a, b) for a, b in zip(p, p[1:]))
 
 
-def _align(path, old, span=700, step=15):
+def _align(path, old, span=900, step=15):
     """Desliza a rota desenhada (sem girar nem mudar o tamanho) até ela encaixar nas ruas da rota
     automática (que vem do OSRM, ou seja, está em cima das ruas reais). Só confia nos trechos
     parecidos: a média considera os 55% de pontos mais próximos."""
