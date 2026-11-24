@@ -440,48 +440,100 @@ def _length(p):
     return sum(_hav(a, b) for a, b in zip(p, p[1:]))
 
 
-def _align(path, old, span=900, step=15):
-    """Desliza a rota desenhada (sem girar nem mudar o tamanho) até ela encaixar nas ruas da rota
-    automática (que vem do OSRM, ou seja, está em cima das ruas reais). Só confia nos trechos
-    parecidos: a média considera os 55% de pontos mais próximos."""
-    lat0 = path[0][0]
-    ky, kx = 111320.0, 111320.0 * math.cos(math.radians(lat0))
-    ref = _densify(old, 10)
-    cell = 30
-    grid = {}
-    for q in ref:
-        grid.setdefault((int(q[1] * kx // cell), int(q[0] * ky // cell)), []).append((q[1] * kx, q[0] * ky))
-    mine = [(q[1] * kx, q[0] * ky) for q in _densify(path, 40)]
+def _dtmap(old, cell=15, margin=2000):
+    """Mapa de distância (em células) até a rota de referência, para comparar posições rapidamente."""
+    ky = 111320.0
+    kx = ky * math.cos(math.radians(old[0][0]))
+    pts = [(q[1] * kx, q[0] * ky) for q in _densify(old, cell)]
+    minx = min(x for x, _ in pts) - margin
+    miny = min(y for _, y in pts) - margin
+    W = int((max(x for x, _ in pts) + margin - minx) / cell) + 1
+    H = int((max(y for _, y in pts) + margin - miny) / cell) + 1
+    d = [1e9] * (W * H)
+    for x, y in pts:
+        d[int((y - miny) / cell) * W + int((x - minx) / cell)] = 0
+    r2 = 1.414
+    for j in range(H):
+        row = j * W
+        for i in range(W):
+            v = d[row + i]
+            if v:
+                if i:
+                    v = min(v, d[row + i - 1] + 1)
+                if j:
+                    up = row - W + i
+                    v = min(v, d[up] + 1)
+                    if i:
+                        v = min(v, d[up - 1] + r2)
+                    if i < W - 1:
+                        v = min(v, d[up + 1] + r2)
+                d[row + i] = v
+    for j in range(H - 1, -1, -1):
+        row = j * W
+        for i in range(W - 1, -1, -1):
+            v = d[row + i]
+            if v:
+                if i < W - 1:
+                    v = min(v, d[row + i + 1] + 1)
+                if j < H - 1:
+                    dn = row + W + i
+                    v = min(v, d[dn] + 1)
+                    if i < W - 1:
+                        v = min(v, d[dn + 1] + r2)
+                    if i:
+                        v = min(v, d[dn - 1] + r2)
+                d[row + i] = v
+    return d, (minx, miny, W, H, cell, kx, ky)
 
-    def cost(dx, dy):
+
+def _apply(path, tf):
+    """Aplica a transformação {"c": [lat, lng], "f": escala, "dx": m leste, "dy": m norte}."""
+    ky = 111320.0
+    kx = ky * math.cos(math.radians(tf["c"][0]))
+    return [[tf["c"][0] + ((q[0] - tf["c"][0]) * tf["f"] * ky + tf["dy"]) / ky,
+             tf["c"][1] + ((q[1] - tf["c"][1]) * tf["f"] * kx + tf["dx"]) / kx] for q in path]
+
+
+def _align(path, old):
+    """Acha escala + deslocamento (sem girar) que encaixam o desenho nas ruas da rota automática
+    (OSRM = em cima das ruas reais). Só confia nos trechos parecidos: usa os 55% de pontos mais
+    próximos. Devolve (transformação, erro médio em metros)."""
+    d, (minx, miny, W, H, cell, kx, ky) = _dtmap(old)
+    c = [sum(q[0] for q in path) / len(path), sum(q[1] for q in path) / len(path)]
+    mine = [((q[1] - c[1]) * kx, (q[0] - c[0]) * ky) for q in _densify(path, 40)]
+    cx, cy = c[1] * kx - minx, c[0] * ky - miny
+    k = max(1, int(len(mine) * 0.55))
+
+    def cost(f, dx, dy):
         ds = []
         for x, y in mine:
-            x += dx; y += dy
-            cx, cy = int(x // cell), int(y // cell)
-            best = 1e9
-            for gx in range(cx - 3, cx + 4):
-                for gy in range(cy - 3, cy + 4):
-                    for rx, ry in grid.get((gx, gy), ()):
-                        d = (rx - x) ** 2 + (ry - y) ** 2
-                        if d < best:
-                            best = d
-            ds.append(min(math.sqrt(best), 100.0))
+            i = int((cx + x * f + dx) / cell)
+            j = int((cy + y * f + dy) / cell)
+            ds.append(min(d[j * W + i] * cell, 100.0) if 0 <= i < W and 0 <= j < H else 100.0)
         ds.sort()
-        k = max(1, int(len(ds) * 0.55))
-        return sum(ds[:k]) / k + 0.004 * math.hypot(dx, dy)
+        return sum(ds[:k]) / k + 0.004 * math.hypot(dx, dy) + 15 * abs(math.log(f))
 
-    best = (cost(0, 0), 0, 0)
-    for r, st in ((span, step), (step * 2, 4)):
-        c0 = (best[1], best[2])
-        for i in range(-int(r // st), int(r // st) + 1):
-            for j in range(-int(r // st), int(r // st) + 1):
-                dx, dy = c0[0] + i * st, c0[1] + j * st
-                c = cost(dx, dy)
-                if c < best[0]:
-                    best = (c, dx, dy)
-    c, dx, dy = best
-    print(f"alinhamento: desloca {dx:.0f} m (leste) {dy:.0f} m (norte); erro médio {c:.1f} m")
-    return [[q[0] + dy / ky, q[1] + dx / kx] for q in path], c
+    best = (1e9, 1, 0, 0)
+
+    def sweep(fs, rng, step, ctr):
+        nonlocal best
+        n = int(rng // step)
+        for f in fs:
+            for i in range(-n, n + 1):
+                for j in range(-n, n + 1):
+                    dx, dy = ctr[0] + i * step, ctr[1] + j * step
+                    v = cost(f, dx, dy)
+                    if v < best[0]:
+                        best = (v, f, dx, dy)
+
+    sweep([0.72 + 0.04 * i for i in range(20)], 1200, 30, (0, 0))
+    for fr, rng, step in ((0.03, 60, 10), (0.008, 14, 3)):
+        _, f0, dx0, dy0 = best
+        sweep([f0 + fr * t / 4 for t in range(-4, 5)], rng, step, (dx0, dy0))
+    v, f, dx, dy = best
+    tf = {"c": c, "f": round(f, 5), "dx": round(dx, 1), "dy": round(dy, 1)}
+    print(f"alinhamento: escala x{f:.3f}, {dx:.0f} m leste, {dy:.0f} m norte; erro médio {v:.1f} m")
+    return tf, v
 
 
 _SHIFT = {}                 # chave da "moldura" -> {"sig", "d": (dlat, dlng) | None}
@@ -509,30 +561,29 @@ def _cache_put(k, v):
 
 
 def _shift_for(fkey, fpath):
-    """Quanto deslocar o desenho (lat, lng) para encaixar nas ruas reais.
-    Calculado uma vez com a rota automática (OSRM) da moldura; vale para todas as rotas dela."""
+    """Transformação (escala + deslocamento) que encaixa o desenho nas ruas reais.
+    Calculada uma vez com a rota automática (OSRM) da moldura; vale para todas as rotas dela."""
     sig = _md5(fpath)
     with _LOCK:
-        c = _SHIFT.get(fkey) or _cache_read().get("shift:" + fkey)
+        c = _SHIFT.get(fkey) or _cache_read().get("shift2:" + fkey)
         if c and c.get("sig") == sig:
             _SHIFT[fkey] = c
-            return c.get("d")
-        for _ in range(60):                       # espera a rota automática ficar pronta (até ~2 min)
+            return c.get("tf")
+        for _ in range(90):                       # espera a rota automática ficar pronta (até ~3 min)
             if _ROUTES.get(fkey, {}).get("ready"):
                 break
             time.sleep(2)
         old = _ROUTES.get(fkey, {}).get("path") or []
-        d = None
+        tf = None
         if len(old) > 5:
-            moved, err = _align(fpath, old)
-            if err <= 25:
-                d = [moved[0][0] - fpath[0][0], moved[0][1] - fpath[0][1]]
-            else:
+            tf, err = _align(fpath, old)
+            if err > 30:
                 print("alinhamento ruim, mantendo posição original")
-            c = {"sig": sig, "d": d}
+                tf = None
+            c = {"sig": sig, "tf": tf}
             _SHIFT[fkey] = c
-            _cache_put("shift:" + fkey, c)
-        return d
+            _cache_put("shift2:" + fkey, c)
+        return tf
 
 
 def _publish(key, sig, path):
@@ -547,9 +598,9 @@ def _snap_job(key, d, sig):
     try:
         fkey = d.get("frame") or key
         fpath = (drawn.get(fkey) or d)["path"]
-        shift = _shift_for(fkey, fpath)
-        if shift:
-            path = [[a + shift[0], b + shift[1]] for a, b in path]
+        tf = _shift_for(fkey, fpath)
+        if tf:
+            path = _apply(path, tf)
             _publish(key, sig, path)              # já mostra o desenho alinhado
         raw = _densify(path)
         out = []
